@@ -1,0 +1,915 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Task Tracker</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            padding: 0;
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+        body > canvas {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        .input-overlay {
+            position: absolute;
+            background: transparent;
+            border: none;
+            outline: none;
+            font-family: inherit;
+            font-size: 14px;
+            padding: 10px 12px;
+            opacity: 0;
+            pointer-events: none;
+        }
+        .input-overlay.active {
+            opacity: 1;
+            pointer-events: auto;
+            background: #fafafc;
+            border: 1px solid #dcdce6;
+            border-radius: 6px;
+        }
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        .modal-overlay.hidden {
+            display: none;
+        }
+        .modal-content {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            width: 480px;
+            max-width: 90%;
+        }
+        .modal-title {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 16px;
+        }
+        .form-label {
+            display: block;
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 6px;
+        }
+        .form-input, .form-select, .form-textarea {
+            width: 100%;
+            padding: 10px 12px;
+            font-size: 14px;
+            border: 1px solid #dcdce6;
+            border-radius: 6px;
+            background: #fafafc;
+        }
+        .form-textarea {
+            min-height: 100px;
+            resize: vertical;
+        }
+        .form-row {
+            display: flex;
+            gap: 12px;
+        }
+        .form-row .form-group {
+            flex: 1;
+        }
+        .modal-actions {
+            display: flex;
+            gap: 12px;
+            justify-content: flex-end;
+            margin-top: 24px;
+        }
+        .btn {
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-size: 14px;
+            cursor: pointer;
+            border: none;
+        }
+        .btn-primary {
+            background: #3b82f6;
+            color: white;
+        }
+        .btn-primary:hover {
+            background: #2563eb;
+        }
+        .btn-secondary {
+            background: #f5f5fa;
+            color: #333;
+            border: 1px solid #dcdce6;
+        }
+        .btn-secondary:hover {
+            background: #eee;
+        }
+        #login-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            z-index: 999;
+        }
+        #login-overlay.hidden {
+            display: none;
+        }
+        #login-username, #login-password {
+            position: absolute;
+            width: 336px;
+            height: 44px;
+            background: transparent;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+
+    <!-- Login form overlay -->
+    <div id="login-overlay">
+        <input type="text" id="login-username" class="input-overlay active" placeholder="Username">
+        <input type="password" id="login-password" class="input-overlay active" placeholder="Password">
+    </div>
+
+    <!-- Create/Edit Task Modal -->
+    <div id="task-modal" class="modal-overlay hidden">
+        <div class="modal-content">
+            <div class="modal-title" id="modal-title">Create Task</div>
+            <form id="task-form">
+                <div class="form-group">
+                    <label class="form-label">Title</label>
+                    <input type="text" class="form-input" id="task-title" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Description</label>
+                    <textarea class="form-textarea" id="task-description"></textarea>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Status</label>
+                        <select class="form-select" id="task-status">
+                            <option value="0">Pending</option>
+                            <option value="1">In Progress</option>
+                            <option value="2">Completed</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Priority</label>
+                        <select class="form-select" id="task-priority">
+                            <option value="0">Low</option>
+                            <option value="1">Medium</option>
+                            <option value="2">High</option>
+                            <option value="3">Urgent</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Category</label>
+                        <input type="text" class="form-input" id="task-category">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Due Date</label>
+                        <input type="date" class="form-input" id="task-due-date">
+                    </div>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-secondary" id="cancel-btn">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="submit-btn">Create</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+<script type="module">
+    // Clay render command types
+    const CLAY_RENDER_COMMAND_TYPE_NONE = 0;
+    const CLAY_RENDER_COMMAND_TYPE_RECTANGLE = 1;
+    const CLAY_RENDER_COMMAND_TYPE_BORDER = 2;
+    const CLAY_RENDER_COMMAND_TYPE_TEXT = 3;
+    const CLAY_RENDER_COMMAND_TYPE_IMAGE = 4;
+    const CLAY_RENDER_COMMAND_TYPE_SCISSOR_START = 5;
+    const CLAY_RENDER_COMMAND_TYPE_SCISSOR_END = 6;
+    const CLAY_RENDER_COMMAND_TYPE_CUSTOM = 7;
+
+    const GLOBAL_FONT_SCALING_FACTOR = 1.0;
+
+    // State
+    let instance;
+    let memoryDataView;
+    let scratchSpaceAddress = 0;
+    let heapSpaceAddress = 0;
+    let renderCommandSize = 0;
+    let previousFrameTime = 0;
+    let authToken = localStorage.getItem('auth_token');
+    let wsConnection = null;
+    let appStatePtr = null;
+
+    const textDecoder = new TextDecoder("utf-8");
+    const textEncoder = new TextEncoder();
+
+    // Font configuration
+    const fontsById = [
+        'system-ui, -apple-system, sans-serif',  // FONT_ID_BODY_16
+        'system-ui, -apple-system, sans-serif',  // FONT_ID_BODY_20
+        'system-ui, -apple-system, sans-serif',  // FONT_ID_TITLE_24
+        'system-ui, -apple-system, sans-serif',  // FONT_ID_TITLE_32
+    ];
+
+    // Data structure definitions for reading WASM memory
+    const colorDefinition = {
+        type: 'struct', members: [
+            { name: 'r', type: 'float' },
+            { name: 'g', type: 'float' },
+            { name: 'b', type: 'float' },
+            { name: 'a', type: 'float' },
+        ]
+    };
+
+    const stringDefinition = {
+        type: 'struct', members: [
+            { name: 'length', type: 'uint32_t' },
+            { name: 'chars', type: 'uint32_t' },
+        ]
+    };
+
+    const cornerRadiusDefinition = {
+        type: 'struct', members: [
+            { name: 'topLeft', type: 'float' },
+            { name: 'topRight', type: 'float' },
+            { name: 'bottomLeft', type: 'float' },
+            { name: 'bottomRight', type: 'float' },
+        ]
+    };
+
+    const borderDefinition = {
+        type: 'struct', members: [
+            { name: 'width', type: 'uint32_t' },
+            { name: 'color', ...colorDefinition },
+        ]
+    };
+
+    const rectangleConfigDefinition = {
+        type: 'struct', members: [
+            { name: 'color', ...colorDefinition },
+            { name: 'cornerRadius', ...cornerRadiusDefinition },
+            { name: 'link', ...stringDefinition },
+            { name: 'cursorPointer', type: 'uint8_t' },
+        ]
+    };
+
+    const borderConfigDefinition = {
+        type: 'struct', members: [
+            { name: 'left', ...borderDefinition },
+            { name: 'right', ...borderDefinition },
+            { name: 'top', ...borderDefinition },
+            { name: 'bottom', ...borderDefinition },
+            { name: 'betweenChildren', ...borderDefinition },
+            { name: 'cornerRadius', ...cornerRadiusDefinition }
+        ]
+    };
+
+    const textConfigDefinition = {
+        type: 'struct', members: [
+            { name: 'textColor', ...colorDefinition },
+            { name: 'fontId', type: 'uint16_t' },
+            { name: 'fontSize', type: 'uint16_t' },
+            { name: 'letterSpacing', type: 'uint16_t' },
+            { name: 'lineHeight', type: 'uint16_t' },
+            { name: 'wrapMode', type: 'uint32_t' },
+            { name: 'disablePointerEvents', type: 'uint8_t' }
+        ]
+    };
+
+    const renderCommandDefinition = {
+        type: 'struct',
+        members: [
+            {
+                name: 'boundingBox', type: 'struct', members: [
+                    { name: 'x', type: 'float' },
+                    { name: 'y', type: 'float' },
+                    { name: 'width', type: 'float' },
+                    { name: 'height', type: 'float' },
+                ]
+            },
+            { name: 'config', type: 'uint32_t' },
+            { name: 'text', ...stringDefinition },
+            { name: 'id', type: 'uint32_t' },
+            { name: 'commandType', type: 'uint32_t' },
+        ]
+    };
+
+    function getStructTotalSize(definition) {
+        switch (definition.type) {
+            case 'union':
+            case 'struct': {
+                let totalSize = 0;
+                for (const member of definition.members) {
+                    let result = getStructTotalSize(member);
+                    if (definition.type === 'struct') {
+                        totalSize += result;
+                    } else {
+                        totalSize = Math.max(totalSize, result);
+                    }
+                }
+                return totalSize;
+            }
+            case 'float': return 4;
+            case 'uint32_t': return 4;
+            case 'uint16_t': return 2;
+            case 'uint8_t': return 1;
+            default: throw "Unimplemented C data type " + definition.type;
+        }
+    }
+
+    function readStructAtAddress(address, definition) {
+        switch (definition.type) {
+            case 'union':
+            case 'struct': {
+                let struct = { __size: 0 };
+                for (const member of definition.members) {
+                    let result = readStructAtAddress(address, member);
+                    struct[member.name] = result;
+                    if (definition.type === 'struct') {
+                        struct.__size += result.__size;
+                        address += result.__size;
+                    } else {
+                        struct.__size = Math.max(struct.__size, result.__size);
+                    }
+                }
+                return struct;
+            }
+            case 'float': return { value: memoryDataView.getFloat32(address, true), __size: 4 };
+            case 'uint32_t': return { value: memoryDataView.getUint32(address, true), __size: 4 };
+            case 'uint16_t': return { value: memoryDataView.getUint16(address, true), __size: 2 };
+            case 'uint8_t': return { value: memoryDataView.getUint8(address, true), __size: 1 };
+            default: throw "Unimplemented C data type " + definition.type;
+        }
+    }
+
+    function getTextDimensions(text, font) {
+        window.canvasContext.font = font;
+        const metrics = window.canvasContext.measureText(text);
+        return {
+            width: metrics.width,
+            height: metrics.fontBoundingBoxAscent + metrics.fontBoundingBoxDescent
+        };
+    }
+
+    // API functions
+    async function apiRequest(endpoint, options = {}) {
+        const headers = {
+            'Content-Type': 'application/json',
+            ...options.headers
+        };
+        if (authToken) {
+            headers['Authorization'] = `Bearer ${authToken}`;
+        }
+
+        const response = await fetch(`/api${endpoint}`, {
+            ...options,
+            headers
+        });
+
+        if (!response.ok) {
+            if (response.status === 401) {
+                authToken = null;
+                localStorage.removeItem('auth_token');
+                instance.exports.SetLoggedIn(false);
+            }
+            throw new Error(`API error: ${response.status}`);
+        }
+
+        return response.json();
+    }
+
+    async function login(username, password) {
+        try {
+            const data = await apiRequest('/auth/login', {
+                method: 'POST',
+                body: JSON.stringify({ username, password })
+            });
+            authToken = data.token;
+            localStorage.setItem('auth_token', authToken);
+            writeStringToMemory(appStatePtr + getAppStateOffset('current_user'), username);
+            instance.exports.SetLoggedIn(true);
+            document.getElementById('login-overlay').classList.add('hidden');
+            await loadTasks();
+            connectWebSocket();
+        } catch (err) {
+            console.error('Login failed:', err);
+            alert('Login failed. Please check your credentials.');
+        }
+    }
+
+    async function loadTasks() {
+        try {
+            const tasks = await apiRequest('/tasks');
+            instance.exports.ClearTasks();
+
+            for (const task of tasks) {
+                const statusMap = { 'Pending': 0, 'InProgress': 1, 'Completed': 2 };
+                const priorityMap = { 'Low': 0, 'Medium': 1, 'High': 2, 'Urgent': 3 };
+
+                // Add task to WASM state
+                instance.exports.AddTask(
+                    task.id || 0,
+                    statusMap[task.status] || 0,
+                    priorityMap[task.priority] || 0
+                );
+
+                // Write strings to task memory
+                const taskCount = instance.exports.GetTaskCount();
+                const taskIndex = taskCount - 1;
+                const taskOffset = getTaskOffset(taskIndex);
+
+                writeStringToMemory(taskOffset + 4, task.title || ''); // title
+                writeStringToMemory(taskOffset + 132, task.description || ''); // description
+                writeStringToMemory(taskOffset + 648, task.category || ''); // category
+                writeStringToMemory(taskOffset + 712, task.due_date ? task.due_date.split('T')[0] : ''); // due_date
+                writeStringToMemory(taskOffset + 744, task.assigned_to_name || ''); // assigned_to
+            }
+        } catch (err) {
+            console.error('Failed to load tasks:', err);
+        }
+    }
+
+    async function createTask(taskData) {
+        try {
+            await apiRequest('/tasks', {
+                method: 'POST',
+                body: JSON.stringify(taskData)
+            });
+            await loadTasks();
+        } catch (err) {
+            console.error('Failed to create task:', err);
+            alert('Failed to create task');
+        }
+    }
+
+    async function updateTask(taskId, taskData) {
+        try {
+            await apiRequest(`/tasks/${taskId}`, {
+                method: 'PUT',
+                body: JSON.stringify(taskData)
+            });
+            await loadTasks();
+        } catch (err) {
+            console.error('Failed to update task:', err);
+            alert('Failed to update task');
+        }
+    }
+
+    async function deleteTask(taskId) {
+        try {
+            await apiRequest(`/tasks/${taskId}`, {
+                method: 'DELETE'
+            });
+            await loadTasks();
+        } catch (err) {
+            console.error('Failed to delete task:', err);
+        }
+    }
+
+    // WebSocket
+    function connectWebSocket() {
+        if (wsConnection) {
+            wsConnection.close();
+        }
+
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        wsConnection = new WebSocket(`${protocol}//${window.location.host}/api/ws`);
+
+        wsConnection.onopen = () => {
+            console.log('WebSocket connected');
+            wsConnection.send(JSON.stringify({ type: 'subscribe' }));
+        };
+
+        wsConnection.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            console.log('WS message:', msg);
+
+            if (msg.type === 'task_created' || msg.type === 'task_updated' || msg.type === 'task_deleted') {
+                loadTasks();
+            }
+        };
+
+        wsConnection.onclose = () => {
+            console.log('WebSocket disconnected, reconnecting...');
+            setTimeout(connectWebSocket, 3000);
+        };
+
+        wsConnection.onerror = (err) => {
+            console.error('WebSocket error:', err);
+        };
+    }
+
+    // Memory helpers
+    function getAppStateOffset(field) {
+        // AppState structure offsets
+        const offsets = {
+            'tasks': 0,
+            'task_count': 81200, // 100 tasks * 812 bytes each
+            'current_user': 81204,
+            'selected_task_index': 81268,
+            'filter_status': 81272,
+            'show_create_modal': 81276,
+            'show_detail_panel': 81277,
+            'logged_in': 81278
+        };
+        return offsets[field] || 0;
+    }
+
+    function getTaskOffset(index) {
+        // Each task is ~812 bytes
+        return appStatePtr + (index * 812);
+    }
+
+    function writeStringToMemory(address, str) {
+        const bytes = textEncoder.encode(str);
+        const maxLen = 127; // Leave room for null terminator
+        const len = Math.min(bytes.length, maxLen);
+        for (let i = 0; i < len; i++) {
+            memoryDataView.setUint8(address + i, bytes[i]);
+        }
+        memoryDataView.setUint8(address + len, 0); // Null terminator
+    }
+
+    // Canvas rendering
+    function renderLoopCanvas() {
+        const capacity = memoryDataView.getUint32(scratchSpaceAddress, true);
+        const length = memoryDataView.getUint32(scratchSpaceAddress + 4, true);
+        let arrayOffset = memoryDataView.getUint32(scratchSpaceAddress + 8, true);
+
+        const canvas = window.canvasRoot;
+        const ctx = window.canvasContext;
+        const scale = window.devicePixelRatio;
+
+        canvas.width = window.innerWidth * scale;
+        canvas.height = window.innerHeight * scale;
+        canvas.style.width = window.innerWidth + 'px';
+        canvas.style.height = window.innerHeight + 'px';
+
+        for (let i = 0; i < length; i++, arrayOffset += renderCommandSize) {
+            const renderCommand = readStructAtAddress(arrayOffset, renderCommandDefinition);
+            const boundingBox = renderCommand.boundingBox;
+            const commandType = renderCommand.commandType.value & 0xff;
+
+            switch (commandType) {
+                case CLAY_RENDER_COMMAND_TYPE_RECTANGLE: {
+                    const config = readStructAtAddress(renderCommand.config.value, rectangleConfigDefinition);
+                    const color = config.color;
+                    ctx.beginPath();
+                    ctx.fillStyle = `rgba(${color.r.value}, ${color.g.value}, ${color.b.value}, ${color.a.value / 255})`;
+                    ctx.roundRect(
+                        boundingBox.x.value * scale,
+                        boundingBox.y.value * scale,
+                        boundingBox.width.value * scale,
+                        boundingBox.height.value * scale,
+                        [
+                            config.cornerRadius.topLeft.value * scale,
+                            config.cornerRadius.topRight.value * scale,
+                            config.cornerRadius.bottomRight.value * scale,
+                            config.cornerRadius.bottomLeft.value * scale
+                        ]
+                    );
+                    ctx.fill();
+                    ctx.closePath();
+                    break;
+                }
+
+                case CLAY_RENDER_COMMAND_TYPE_BORDER: {
+                    const config = readStructAtAddress(renderCommand.config.value, borderConfigDefinition);
+
+                    // Top border
+                    if (config.top.width.value > 0) {
+                        const color = config.top.color;
+                        ctx.strokeStyle = `rgba(${color.r.value}, ${color.g.value}, ${color.b.value}, ${color.a.value / 255})`;
+                        ctx.lineWidth = config.top.width.value * scale;
+                        ctx.beginPath();
+                        ctx.moveTo(boundingBox.x.value * scale, (boundingBox.y.value + config.top.width.value / 2) * scale);
+                        ctx.lineTo((boundingBox.x.value + boundingBox.width.value) * scale, (boundingBox.y.value + config.top.width.value / 2) * scale);
+                        ctx.stroke();
+                    }
+
+                    // Bottom border
+                    if (config.bottom.width.value > 0) {
+                        const color = config.bottom.color;
+                        ctx.strokeStyle = `rgba(${color.r.value}, ${color.g.value}, ${color.b.value}, ${color.a.value / 255})`;
+                        ctx.lineWidth = config.bottom.width.value * scale;
+                        ctx.beginPath();
+                        ctx.moveTo(boundingBox.x.value * scale, (boundingBox.y.value + boundingBox.height.value - config.bottom.width.value / 2) * scale);
+                        ctx.lineTo((boundingBox.x.value + boundingBox.width.value) * scale, (boundingBox.y.value + boundingBox.height.value - config.bottom.width.value / 2) * scale);
+                        ctx.stroke();
+                    }
+
+                    // Left border
+                    if (config.left.width.value > 0) {
+                        const color = config.left.color;
+                        ctx.strokeStyle = `rgba(${color.r.value}, ${color.g.value}, ${color.b.value}, ${color.a.value / 255})`;
+                        ctx.lineWidth = config.left.width.value * scale;
+                        ctx.beginPath();
+                        ctx.moveTo((boundingBox.x.value + config.left.width.value / 2) * scale, boundingBox.y.value * scale);
+                        ctx.lineTo((boundingBox.x.value + config.left.width.value / 2) * scale, (boundingBox.y.value + boundingBox.height.value) * scale);
+                        ctx.stroke();
+                    }
+
+                    // Right border
+                    if (config.right.width.value > 0) {
+                        const color = config.right.color;
+                        ctx.strokeStyle = `rgba(${color.r.value}, ${color.g.value}, ${color.b.value}, ${color.a.value / 255})`;
+                        ctx.lineWidth = config.right.width.value * scale;
+                        ctx.beginPath();
+                        ctx.moveTo((boundingBox.x.value + boundingBox.width.value - config.right.width.value / 2) * scale, boundingBox.y.value * scale);
+                        ctx.lineTo((boundingBox.x.value + boundingBox.width.value - config.right.width.value / 2) * scale, (boundingBox.y.value + boundingBox.height.value) * scale);
+                        ctx.stroke();
+                    }
+                    break;
+                }
+
+                case CLAY_RENDER_COMMAND_TYPE_TEXT: {
+                    const config = readStructAtAddress(renderCommand.config.value, textConfigDefinition);
+                    const textContents = renderCommand.text;
+                    const stringContents = new Uint8Array(
+                        memoryDataView.buffer.slice(
+                            textContents.chars.value,
+                            textContents.chars.value + textContents.length.value
+                        )
+                    );
+                    const text = textDecoder.decode(stringContents);
+                    const fontSize = config.fontSize.value * GLOBAL_FONT_SCALING_FACTOR * scale;
+
+                    ctx.font = `${fontSize}px ${fontsById[config.fontId.value] || 'sans-serif'}`;
+                    const color = config.textColor;
+                    ctx.textBaseline = 'middle';
+                    ctx.fillStyle = `rgba(${color.r.value}, ${color.g.value}, ${color.b.value}, ${color.a.value / 255})`;
+                    ctx.fillText(
+                        text,
+                        boundingBox.x.value * scale,
+                        (boundingBox.y.value + boundingBox.height.value / 2) * scale
+                    );
+                    break;
+                }
+
+                case CLAY_RENDER_COMMAND_TYPE_SCISSOR_START: {
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(
+                        boundingBox.x.value * scale,
+                        boundingBox.y.value * scale,
+                        boundingBox.width.value * scale,
+                        boundingBox.height.value * scale
+                    );
+                    ctx.clip();
+                    ctx.closePath();
+                    break;
+                }
+
+                case CLAY_RENDER_COMMAND_TYPE_SCISSOR_END: {
+                    ctx.restore();
+                    break;
+                }
+            }
+        }
+    }
+
+    // Position login inputs over Clay-rendered boxes
+    function positionLoginInputs() {
+        if (!instance) return;
+
+        // Center of screen calculations for login box
+        const centerX = window.innerWidth / 2;
+        const centerY = window.innerHeight / 2;
+
+        // Login box is 400px wide, inputs are full width with 32px padding
+        const inputWidth = 336;
+        const inputLeft = centerX - 168;
+
+        // Approximate positions based on login box layout
+        const usernameInput = document.getElementById('login-username');
+        const passwordInput = document.getElementById('login-password');
+
+        usernameInput.style.left = inputLeft + 'px';
+        usernameInput.style.top = (centerY - 20) + 'px';
+
+        passwordInput.style.left = inputLeft + 'px';
+        passwordInput.style.top = (centerY + 40) + 'px';
+    }
+
+    // Main render loop
+    function renderLoop(currentTime) {
+        const elapsed = currentTime - previousFrameTime;
+        previousFrameTime = currentTime;
+
+        instance.exports.UpdateDrawFrame(
+            scratchSpaceAddress,
+            window.innerWidth,
+            window.innerHeight,
+            window.mouseWheelXThisFrame || 0,
+            window.mouseWheelYThisFrame || 0,
+            window.mousePositionX || 0,
+            window.mousePositionY || 0,
+            window.touchDown || false,
+            window.mouseDown || false,
+            elapsed / 1000
+        );
+
+        renderLoopCanvas();
+
+        // Check if we need to show create modal
+        if (instance.exports.GetShowCreateModal()) {
+            showCreateModal();
+        }
+
+        // Position login inputs if on login screen
+        if (!authToken) {
+            positionLoginInputs();
+        }
+
+        requestAnimationFrame(renderLoop);
+        window.mouseDown = false;
+    }
+
+    // Modal functions
+    function showCreateModal() {
+        document.getElementById('task-modal').classList.remove('hidden');
+        document.getElementById('modal-title').textContent = 'Create Task';
+        document.getElementById('submit-btn').textContent = 'Create';
+        document.getElementById('task-form').reset();
+    }
+
+    function hideModal() {
+        document.getElementById('task-modal').classList.add('hidden');
+    }
+
+    // Initialize
+    async function init() {
+        window.canvasRoot = document.getElementById('canvas');
+        window.canvasContext = window.canvasRoot.getContext('2d');
+        window.mousePositionX = 0;
+        window.mousePositionY = 0;
+        window.mouseWheelXThisFrame = 0;
+        window.mouseWheelYThisFrame = 0;
+        window.touchDown = false;
+        window.mouseDown = false;
+
+        // Event listeners
+        let wheelTimeout = null;
+        document.addEventListener('wheel', (e) => {
+            window.mouseWheelXThisFrame = e.deltaX * -0.1;
+            window.mouseWheelYThisFrame = e.deltaY * -0.1;
+            clearTimeout(wheelTimeout);
+            wheelTimeout = setTimeout(() => {
+                window.mouseWheelXThisFrame = 0;
+                window.mouseWheelYThisFrame = 0;
+            }, 10);
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            window.mousePositionX = e.clientX;
+            window.mousePositionY = e.clientY;
+        });
+
+        document.addEventListener('mousedown', () => {
+            window.mouseDown = true;
+        });
+
+        document.addEventListener('touchstart', (e) => {
+            if (e.touches.length === 1) {
+                window.touchDown = true;
+                window.mousePositionX = e.touches[0].clientX;
+                window.mousePositionY = e.touches[0].clientY;
+            }
+        });
+
+        document.addEventListener('touchmove', (e) => {
+            if (e.touches.length === 1) {
+                window.mousePositionX = e.touches[0].clientX;
+                window.mousePositionY = e.touches[0].clientY;
+            }
+        });
+
+        document.addEventListener('touchend', () => {
+            window.touchDown = false;
+        });
+
+        // Login form handling
+        document.getElementById('login-password').addEventListener('keypress', async (e) => {
+            if (e.key === 'Enter') {
+                const username = document.getElementById('login-username').value;
+                const password = document.getElementById('login-password').value;
+                if (username && password) {
+                    await login(username, password);
+                }
+            }
+        });
+
+        // Task form handling
+        document.getElementById('task-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const statusMap = ['Pending', 'InProgress', 'Completed'];
+            const priorityMap = ['Low', 'Medium', 'High', 'Urgent'];
+
+            const taskData = {
+                title: document.getElementById('task-title').value,
+                description: document.getElementById('task-description').value || null,
+                status: statusMap[parseInt(document.getElementById('task-status').value)],
+                priority: priorityMap[parseInt(document.getElementById('task-priority').value)],
+                category: document.getElementById('task-category').value || null,
+                due_date: document.getElementById('task-due-date').value || null
+            };
+
+            await createTask(taskData);
+            hideModal();
+        });
+
+        document.getElementById('cancel-btn').addEventListener('click', hideModal);
+
+        // Load WASM
+        const importObject = {
+            clay: {
+                measureTextFunction: (addressOfDimensions, textToMeasure, addressOfConfig) => {
+                    const stringLength = memoryDataView.getUint32(textToMeasure, true);
+                    const pointerToString = memoryDataView.getUint32(textToMeasure + 4, true);
+                    const textConfig = readStructAtAddress(addressOfConfig, textConfigDefinition);
+                    const text = textDecoder.decode(
+                        memoryDataView.buffer.slice(pointerToString, pointerToString + stringLength)
+                    );
+                    const dimensions = getTextDimensions(
+                        text,
+                        `${Math.round(textConfig.fontSize.value * GLOBAL_FONT_SCALING_FACTOR)}px ${fontsById[textConfig.fontId.value] || 'sans-serif'}`
+                    );
+                    memoryDataView.setFloat32(addressOfDimensions, dimensions.width, true);
+                    memoryDataView.setFloat32(addressOfDimensions + 4, dimensions.height, true);
+                }
+            }
+        };
+
+        const { instance: wasmInstance } = await WebAssembly.instantiateStreaming(
+            fetch('./app.wasm'),
+            importObject
+        );
+
+        instance = wasmInstance;
+        memoryDataView = new DataView(new Uint8Array(instance.exports.memory.buffer).buffer);
+        scratchSpaceAddress = instance.exports.__heap_base.value;
+        heapSpaceAddress = scratchSpaceAddress + 1024;
+
+        // Initialize Clay
+        const arenaAddress = scratchSpaceAddress;
+        const memorySize = instance.exports.Clay_MinMemorySize();
+        instance.exports.Clay_CreateArenaWithCapacityAndMemory(arenaAddress, memorySize, heapSpaceAddress);
+        instance.exports.Clay_Initialize(arenaAddress);
+
+        // Set scratch memory
+        instance.exports.SetScratchMemory(heapSpaceAddress + memorySize);
+
+        // Initialize app
+        instance.exports.InitApp();
+        appStatePtr = instance.exports.GetAppState();
+
+        renderCommandSize = getStructTotalSize(renderCommandDefinition);
+
+        // Check for existing auth token
+        if (authToken) {
+            try {
+                await loadTasks();
+                instance.exports.SetLoggedIn(true);
+                document.getElementById('login-overlay').classList.add('hidden');
+                connectWebSocket();
+            } catch (err) {
+                authToken = null;
+                localStorage.removeItem('auth_token');
+            }
+        }
+
+        // Start render loop
+        requestAnimationFrame(renderLoop);
+    }
+
+    init();
+</script>
+</body>
+</html>

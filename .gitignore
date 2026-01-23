@@ -1,0 +1,13 @@
+# Build outputs
+frontend/dist/app.wasm
+backend/target/
+
+# Database
+*.redb
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
