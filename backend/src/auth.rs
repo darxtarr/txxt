@@ -112,10 +112,24 @@ pub async fn auth_middleware(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
 
+    // Dev mode: allow unauthenticated requests by treating them as the default admin user.
+    // This is for UI/layout iteration; tighten it back up when we care about auth.
     let token = match auth_header {
-        Some(h) if h.starts_with("Bearer ") => &h[7..],
-        _ => return Err((StatusCode::UNAUTHORIZED, "Missing authorization".to_string())),
+        Some(h) if h.starts_with("Bearer ") => Some(&h[7..]),
+        _ => None,
     };
+
+    if token.is_none() {
+        let user = state
+            .db
+            .get_user_by_username("admin")
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .ok_or((StatusCode::UNAUTHORIZED, "Default user not found".to_string()))?;
+        request.extensions_mut().insert(user);
+        return Ok(next.run(request).await);
+    }
+
+    let token = token.unwrap();
 
     let claims = verify_token(token)
         .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid token".to_string()))?;

@@ -230,7 +230,8 @@
     let memoryDataView;
     let scratchSpaceAddress = 0;
     let heapSpaceAddress = 0;
-    let renderCommandSize = 0;
+    let cmdBufferAddress = 0;
+    const CMD_BUFFER_BYTES = 1024 * 1024;
     let previousFrameTime = 0;
     let canvasPixelWidth = 0;
     let canvasPixelHeight = 0;
@@ -247,7 +248,8 @@
     let hudDrawMs = 0;
     let hudCmds = 0;
     let hudTextCmds = 0;
-    let authToken = localStorage.getItem('auth_token');
+    // Dev mode: backend accepts requests without auth for UI iteration.
+    let authToken = null;
     let wsConnection = null;
     let appStatePtr = null;
 
@@ -262,136 +264,9 @@
         'system-ui, -apple-system, sans-serif',  // FONT_ID_TITLE_32
     ];
 
-    // Data structure definitions for reading WASM memory
-    const colorDefinition = {
-        type: 'struct', members: [
-            { name: 'r', type: 'float' },
-            { name: 'g', type: 'float' },
-            { name: 'b', type: 'float' },
-            { name: 'a', type: 'float' },
-        ]
-    };
-
-    const stringDefinition = {
-        type: 'struct', members: [
-            { name: 'length', type: 'uint32_t' },
-            { name: 'chars', type: 'uint32_t' },
-        ]
-    };
-
-    const cornerRadiusDefinition = {
-        type: 'struct', members: [
-            { name: 'topLeft', type: 'float' },
-            { name: 'topRight', type: 'float' },
-            { name: 'bottomLeft', type: 'float' },
-            { name: 'bottomRight', type: 'float' },
-        ]
-    };
-
-    const borderDefinition = {
-        type: 'struct', members: [
-            { name: 'width', type: 'uint32_t' },
-            { name: 'color', ...colorDefinition },
-        ]
-    };
-
-    const rectangleConfigDefinition = {
-        type: 'struct', members: [
-            { name: 'color', ...colorDefinition },
-            { name: 'cornerRadius', ...cornerRadiusDefinition },
-            { name: 'link', ...stringDefinition },
-            { name: 'cursorPointer', type: 'uint8_t' },
-        ]
-    };
-
-    const borderConfigDefinition = {
-        type: 'struct', members: [
-            { name: 'left', ...borderDefinition },
-            { name: 'right', ...borderDefinition },
-            { name: 'top', ...borderDefinition },
-            { name: 'bottom', ...borderDefinition },
-            { name: 'betweenChildren', ...borderDefinition },
-            { name: 'cornerRadius', ...cornerRadiusDefinition }
-        ]
-    };
-
-    const textConfigDefinition = {
-        type: 'struct', members: [
-            { name: 'textColor', ...colorDefinition },
-            { name: 'fontId', type: 'uint16_t' },
-            { name: 'fontSize', type: 'uint16_t' },
-            { name: 'letterSpacing', type: 'uint16_t' },
-            { name: 'lineHeight', type: 'uint16_t' },
-            { name: 'wrapMode', type: 'uint32_t' },
-            { name: 'disablePointerEvents', type: 'uint8_t' }
-        ]
-    };
-
-    const renderCommandDefinition = {
-        type: 'struct',
-        members: [
-            {
-                name: 'boundingBox', type: 'struct', members: [
-                    { name: 'x', type: 'float' },
-                    { name: 'y', type: 'float' },
-                    { name: 'width', type: 'float' },
-                    { name: 'height', type: 'float' },
-                ]
-            },
-            { name: 'config', type: 'uint32_t' },
-            { name: 'text', ...stringDefinition },
-            { name: 'id', type: 'uint32_t' },
-            { name: 'commandType', type: 'uint32_t' },
-        ]
-    };
-
-    function getStructTotalSize(definition) {
-        switch (definition.type) {
-            case 'union':
-            case 'struct': {
-                let totalSize = 0;
-                for (const member of definition.members) {
-                    let result = getStructTotalSize(member);
-                    if (definition.type === 'struct') {
-                        totalSize += result;
-                    } else {
-                        totalSize = Math.max(totalSize, result);
-                    }
-                }
-                return totalSize;
-            }
-            case 'float': return 4;
-            case 'uint32_t': return 4;
-            case 'uint16_t': return 2;
-            case 'uint8_t': return 1;
-            default: throw "Unimplemented C data type " + definition.type;
-        }
-    }
-
-    function readStructAtAddress(address, definition) {
-        switch (definition.type) {
-            case 'union':
-            case 'struct': {
-                let struct = { __size: 0 };
-                for (const member of definition.members) {
-                    let result = readStructAtAddress(address, member);
-                    struct[member.name] = result;
-                    if (definition.type === 'struct') {
-                        struct.__size += result.__size;
-                        address += result.__size;
-                    } else {
-                        struct.__size = Math.max(struct.__size, result.__size);
-                    }
-                }
-                return struct;
-            }
-            case 'float': return { value: memoryDataView.getFloat32(address, true), __size: 4 };
-            case 'uint32_t': return { value: memoryDataView.getUint32(address, true), __size: 4 };
-            case 'uint16_t': return { value: memoryDataView.getUint16(address, true), __size: 2 };
-            case 'uint8_t': return { value: memoryDataView.getUint8(address, true), __size: 1 };
-            default: throw "Unimplemented C data type " + definition.type;
-        }
-    }
+    // Packed render command stream produced by WASM (do not parse Clay structs from JS).
+    const PACKED_HDR_SIZE = 16;
+    const PACKED_CMD_SIZE = 64;
 
     function getTextDimensions(text, font) {
         window.canvasContext.font = font;
@@ -600,9 +475,9 @@
 
     // Canvas rendering
     function renderLoopCanvas() {
-        const capacity = memoryDataView.getUint32(scratchSpaceAddress, true);
-        const length = memoryDataView.getUint32(scratchSpaceAddress + 4, true);
-        let arrayOffset = memoryDataView.getUint32(scratchSpaceAddress + 8, true);
+        let length = memoryDataView.getUint32(cmdBufferAddress + 0, true);
+        const cmdSize = memoryDataView.getUint32(cmdBufferAddress + 4, true);
+        let arrayOffset = memoryDataView.getUint32(cmdBufferAddress + 8, true);
 
         const canvas = window.canvasRoot;
         const ctx = window.canvasContext;
@@ -611,30 +486,48 @@
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.clearRect(0, 0, canvasPixelWidth, canvasPixelHeight);
 
+        const maxLen = Math.floor((CMD_BUFFER_BYTES - PACKED_HDR_SIZE) / PACKED_CMD_SIZE);
+        if (length > maxLen) {
+            length = maxLen;
+        }
+
         hudCmds = length;
         hudTextCmds = 0;
 
-        for (let i = 0; i < length; i++, arrayOffset += renderCommandSize) {
-            const renderCommand = readStructAtAddress(arrayOffset, renderCommandDefinition);
-            const boundingBox = renderCommand.boundingBox;
-            const commandType = renderCommand.commandType.value & 0xff;
+        const stride = cmdSize || PACKED_CMD_SIZE;
+
+        for (let i = 0; i < length; i++, arrayOffset += stride) {
+            const commandType = memoryDataView.getUint8(arrayOffset + 0);
+            const zIndex = memoryDataView.getInt16(arrayOffset + 2, true);
+            const x = memoryDataView.getFloat32(arrayOffset + 4, true);
+            const y = memoryDataView.getFloat32(arrayOffset + 8, true);
+            const w = memoryDataView.getFloat32(arrayOffset + 12, true);
+            const h = memoryDataView.getFloat32(arrayOffset + 16, true);
 
             switch (commandType) {
                 case CLAY_RENDER_COMMAND_TYPE_RECTANGLE: {
-                    const config = readStructAtAddress(renderCommand.config.value, rectangleConfigDefinition);
-                    const color = config.color;
+                    const r = memoryDataView.getFloat32(arrayOffset + 20, true);
+                    const g = memoryDataView.getFloat32(arrayOffset + 24, true);
+                    const b = memoryDataView.getFloat32(arrayOffset + 28, true);
+                    const a = memoryDataView.getFloat32(arrayOffset + 32, true);
+
+                    const tl = memoryDataView.getFloat32(arrayOffset + 36, true);
+                    const tr = memoryDataView.getFloat32(arrayOffset + 40, true);
+                    const br = memoryDataView.getFloat32(arrayOffset + 44, true);
+                    const bl = memoryDataView.getFloat32(arrayOffset + 48, true);
+
                     ctx.beginPath();
-                    ctx.fillStyle = `rgba(${color.r.value}, ${color.g.value}, ${color.b.value}, ${color.a.value / 255})`;
+                    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
                     ctx.roundRect(
-                        boundingBox.x.value * scale,
-                        boundingBox.y.value * scale,
-                        boundingBox.width.value * scale,
-                        boundingBox.height.value * scale,
+                        x * scale,
+                        y * scale,
+                        w * scale,
+                        h * scale,
                         [
-                            config.cornerRadius.topLeft.value * scale,
-                            config.cornerRadius.topRight.value * scale,
-                            config.cornerRadius.bottomRight.value * scale,
-                            config.cornerRadius.bottomLeft.value * scale
+                            tl * scale,
+                            tr * scale,
+                            br * scale,
+                            bl * scale
                         ]
                     );
                     ctx.fill();
@@ -643,74 +536,78 @@
                 }
 
                 case CLAY_RENDER_COMMAND_TYPE_BORDER: {
-                    const config = readStructAtAddress(renderCommand.config.value, borderConfigDefinition);
+                    const r = memoryDataView.getFloat32(arrayOffset + 20, true);
+                    const g = memoryDataView.getFloat32(arrayOffset + 24, true);
+                    const b = memoryDataView.getFloat32(arrayOffset + 28, true);
+                    const a = memoryDataView.getFloat32(arrayOffset + 32, true);
+
+                    const left = memoryDataView.getUint16(arrayOffset + 52, true);
+                    const right = memoryDataView.getUint16(arrayOffset + 54, true);
+                    const top = memoryDataView.getUint16(arrayOffset + 56, true);
+                    const bottom = memoryDataView.getUint16(arrayOffset + 58, true);
+
+                    ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
 
                     // Top border
-                    if (config.top.width.value > 0) {
-                        const color = config.top.color;
-                        ctx.strokeStyle = `rgba(${color.r.value}, ${color.g.value}, ${color.b.value}, ${color.a.value / 255})`;
-                        ctx.lineWidth = config.top.width.value * scale;
+                    if (top > 0) {
+                        ctx.lineWidth = top * scale;
                         ctx.beginPath();
-                        ctx.moveTo(boundingBox.x.value * scale, (boundingBox.y.value + config.top.width.value / 2) * scale);
-                        ctx.lineTo((boundingBox.x.value + boundingBox.width.value) * scale, (boundingBox.y.value + config.top.width.value / 2) * scale);
+                        ctx.moveTo(x * scale, (y + top / 2) * scale);
+                        ctx.lineTo((x + w) * scale, (y + top / 2) * scale);
                         ctx.stroke();
                     }
 
                     // Bottom border
-                    if (config.bottom.width.value > 0) {
-                        const color = config.bottom.color;
-                        ctx.strokeStyle = `rgba(${color.r.value}, ${color.g.value}, ${color.b.value}, ${color.a.value / 255})`;
-                        ctx.lineWidth = config.bottom.width.value * scale;
+                    if (bottom > 0) {
+                        ctx.lineWidth = bottom * scale;
                         ctx.beginPath();
-                        ctx.moveTo(boundingBox.x.value * scale, (boundingBox.y.value + boundingBox.height.value - config.bottom.width.value / 2) * scale);
-                        ctx.lineTo((boundingBox.x.value + boundingBox.width.value) * scale, (boundingBox.y.value + boundingBox.height.value - config.bottom.width.value / 2) * scale);
+                        ctx.moveTo(x * scale, (y + h - bottom / 2) * scale);
+                        ctx.lineTo((x + w) * scale, (y + h - bottom / 2) * scale);
                         ctx.stroke();
                     }
 
                     // Left border
-                    if (config.left.width.value > 0) {
-                        const color = config.left.color;
-                        ctx.strokeStyle = `rgba(${color.r.value}, ${color.g.value}, ${color.b.value}, ${color.a.value / 255})`;
-                        ctx.lineWidth = config.left.width.value * scale;
+                    if (left > 0) {
+                        ctx.lineWidth = left * scale;
                         ctx.beginPath();
-                        ctx.moveTo((boundingBox.x.value + config.left.width.value / 2) * scale, boundingBox.y.value * scale);
-                        ctx.lineTo((boundingBox.x.value + config.left.width.value / 2) * scale, (boundingBox.y.value + boundingBox.height.value) * scale);
+                        ctx.moveTo((x + left / 2) * scale, y * scale);
+                        ctx.lineTo((x + left / 2) * scale, (y + h) * scale);
                         ctx.stroke();
                     }
 
                     // Right border
-                    if (config.right.width.value > 0) {
-                        const color = config.right.color;
-                        ctx.strokeStyle = `rgba(${color.r.value}, ${color.g.value}, ${color.b.value}, ${color.a.value / 255})`;
-                        ctx.lineWidth = config.right.width.value * scale;
+                    if (right > 0) {
+                        ctx.lineWidth = right * scale;
                         ctx.beginPath();
-                        ctx.moveTo((boundingBox.x.value + boundingBox.width.value - config.right.width.value / 2) * scale, boundingBox.y.value * scale);
-                        ctx.lineTo((boundingBox.x.value + boundingBox.width.value - config.right.width.value / 2) * scale, (boundingBox.y.value + boundingBox.height.value) * scale);
+                        ctx.moveTo((x + w - right / 2) * scale, y * scale);
+                        ctx.lineTo((x + w - right / 2) * scale, (y + h) * scale);
                         ctx.stroke();
                     }
                     break;
                 }
 
                 case CLAY_RENDER_COMMAND_TYPE_TEXT: {
-                    const config = readStructAtAddress(renderCommand.config.value, textConfigDefinition);
-                    const textContents = renderCommand.text;
                     hudTextCmds++;
-                    const stringContents = new Uint8Array(
-                        memoryDataView.buffer,
-                        textContents.chars.value,
-                        textContents.length.value
-                    );
-                    const text = textDecoder.decode(stringContents);
-                    const fontSize = config.fontSize.value * GLOBAL_FONT_SCALING_FACTOR * scale;
+                    const textPtr = memoryDataView.getUint32(arrayOffset + 20, true);
+                    const textLen = memoryDataView.getUint32(arrayOffset + 24, true);
+                    const fontId = memoryDataView.getUint16(arrayOffset + 28, true);
+                    const fontSizeRaw = memoryDataView.getUint16(arrayOffset + 30, true);
+                    const r = memoryDataView.getFloat32(arrayOffset + 36, true);
+                    const g = memoryDataView.getFloat32(arrayOffset + 40, true);
+                    const b = memoryDataView.getFloat32(arrayOffset + 44, true);
+                    const a = memoryDataView.getFloat32(arrayOffset + 48, true);
 
-                    ctx.font = `${fontSize}px ${fontsById[config.fontId.value] || 'sans-serif'}`;
-                    const color = config.textColor;
+                    const stringContents = new Uint8Array(memoryDataView.buffer, textPtr, textLen);
+                    const text = textDecoder.decode(stringContents);
+                    const fontSize = fontSizeRaw * GLOBAL_FONT_SCALING_FACTOR * scale;
+
+                    ctx.font = `${fontSize}px ${fontsById[fontId] || 'sans-serif'}`;
                     ctx.textBaseline = 'middle';
-                    ctx.fillStyle = `rgba(${color.r.value}, ${color.g.value}, ${color.b.value}, ${color.a.value / 255})`;
+                    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
                     ctx.fillText(
                         text,
-                        boundingBox.x.value * scale,
-                        (boundingBox.y.value + boundingBox.height.value / 2) * scale
+                        x * scale,
+                        (y + h / 2) * scale
                     );
                     break;
                 }
@@ -719,10 +616,10 @@
                     ctx.save();
                     ctx.beginPath();
                     ctx.rect(
-                        boundingBox.x.value * scale,
-                        boundingBox.y.value * scale,
-                        boundingBox.width.value * scale,
-                        boundingBox.height.value * scale
+                        x * scale,
+                        y * scale,
+                        w * scale,
+                        h * scale
                     );
                     ctx.clip();
                     ctx.closePath();
@@ -732,9 +629,9 @@
                 case CLAY_RENDER_COMMAND_TYPE_SCISSOR_END: {
                     ctx.restore();
                     break;
-                }
             }
         }
+    }
 
         if (hudEnabled) {
             const pad = 10 * scale;
@@ -833,7 +730,7 @@
         const wasmStart = performance.now();
 
         instance.exports.UpdateDrawFrame(
-            scratchSpaceAddress,
+            cmdBufferAddress,
             window.innerWidth,
             window.innerHeight,
             window.mouseWheelXThisFrame || 0,
@@ -933,6 +830,15 @@
             if (e.key === 'F2') {
                 hudEnabled = !hudEnabled;
             }
+
+            // Clay debug toggle: Ctrl+D (avoid browser-reserved keys like F3 search)
+            if ((e.ctrlKey || e.metaKey) && (e.key === 'd' || e.key === 'D')) {
+                e.preventDefault();
+                if (instance?.exports?.Clay_IsDebugModeEnabled && instance?.exports?.Clay_SetDebugModeEnabled) {
+                    const enabled = instance.exports.Clay_IsDebugModeEnabled();
+                    instance.exports.Clay_SetDebugModeEnabled(!enabled);
+                }
+            }
         });
 
         document.addEventListener('touchstart', (e) => {
@@ -997,12 +903,20 @@
                 measureTextFunction: (addressOfDimensions, textToMeasure, addressOfConfig) => {
                     const stringLength = memoryDataView.getUint32(textToMeasure, true);
                     const pointerToString = memoryDataView.getUint32(textToMeasure + 4, true);
-                    const textConfig = readStructAtAddress(addressOfConfig, textConfigDefinition);
+
+                    // Clay_TextElementConfig layout (wasm32):
+                    // +0  u32 userData ptr
+                    // +4  Clay_Color (4 f32)
+                    // +20 u16 fontId
+                    // +22 u16 fontSize
+                    const fontId = memoryDataView.getUint16(addressOfConfig + 20, true);
+                    const fontSize = memoryDataView.getUint16(addressOfConfig + 22, true);
+
                     const bytes = new Uint8Array(memoryDataView.buffer, pointerToString, stringLength);
                     const text = textDecoder.decode(bytes);
                     const dimensions = getTextDimensions(
                         text,
-                        `${Math.round(textConfig.fontSize.value * GLOBAL_FONT_SCALING_FACTOR)}px ${fontsById[textConfig.fontId.value] || 'sans-serif'}`
+                        `${Math.round(fontSize * GLOBAL_FONT_SCALING_FACTOR)}px ${fontsById[fontId] || 'sans-serif'}`
                     );
                     memoryDataView.setFloat32(addressOfDimensions, dimensions.width, true);
                     memoryDataView.setFloat32(addressOfDimensions + 4, dimensions.height, true);
@@ -1014,8 +928,10 @@
             }
         };
 
+        // Avoid stale WASM during rapid iteration.
+        const wasmUrl = `./app.wasm?cachebust=${Date.now()}`;
         const { instance: wasmInstance } = await WebAssembly.instantiateStreaming(
-            fetch('./app.wasm'),
+            fetch(wasmUrl, { cache: 'no-store' }),
             importObject
         );
 
@@ -1030,35 +946,27 @@
         instance.exports.Clay_CreateArenaWithCapacityAndMemory(arenaAddress, memorySize, heapSpaceAddress);
         instance.exports.Clay_Initialize(arenaAddress);
 
-        // Set scratch memory
-        instance.exports.SetScratchMemory(heapSpaceAddress + memorySize);
+        // Reserve space for packed render commands; use the following region as scratch arena.
+        cmdBufferAddress = heapSpaceAddress + memorySize;
+        instance.exports.SetScratchMemory(cmdBufferAddress + CMD_BUFFER_BYTES);
 
         // Initialize app
         instance.exports.InitApp();
         appStatePtr = instance.exports.GetAppState();
 
-        renderCommandSize = getStructTotalSize(renderCommandDefinition);
-
         resizeCanvasIfNeeded();
 
-        // Check for existing auth token
-        if (authToken) {
-            try {
-                await loadTasks();
-                instance.exports.SetLoggedIn(true);
-                document.getElementById('login-overlay').classList.add('hidden');
-                connectWebSocket();
-            } catch (err) {
-                authToken = null;
-                localStorage.removeItem('auth_token');
-            }
+        // Dev mode: skip login, go straight to tasks.
+        try {
+            await loadTasks();
+        } catch (_err) {
+            // Ignore; backend may be down during frontend iteration.
         }
+        instance.exports.SetLoggedIn(true);
+        document.getElementById('login-overlay').classList.add('hidden');
+        connectWebSocket();
 
-        // If we start on the login screen, focus the username field once.
-        if (!authToken && !loginFocusInitialized) {
-            loginFocusInitialized = true;
-            document.getElementById('login-username').focus();
-        }
+        // Login overlay is disabled in dev mode.
 
         // Start render loop
         // Position login inputs immediately (before first frame) if needed.

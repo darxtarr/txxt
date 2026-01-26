@@ -843,8 +843,164 @@ CLAY_WASM_EXPORT("SetScratchMemory") void SetScratchMemory(void* memory) {
     frame_arena.memory = memory;
 }
 
-CLAY_WASM_EXPORT("UpdateDrawFrame") Clay_RenderCommandArray UpdateDrawFrame(
-    uint32_t scratch_address,
+#define TXXT_PACKED_CMD_SIZE 64u
+#define TXXT_PACKED_HDR_SIZE 16u
+
+static inline void write_u16(uint8_t* p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xff);
+    p[1] = (uint8_t)((v >> 8) & 0xff);
+}
+
+static inline void write_i16(uint8_t* p, int16_t v) {
+    write_u16(p, (uint16_t)v);
+}
+
+static inline void write_u32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xff);
+    p[1] = (uint8_t)((v >> 8) & 0xff);
+    p[2] = (uint8_t)((v >> 16) & 0xff);
+    p[3] = (uint8_t)((v >> 24) & 0xff);
+}
+
+static inline void write_f32(uint8_t* p, float v) {
+    union { float f; uint32_t u; } u = { .f = v };
+    write_u32(p, u.u);
+}
+
+static void PackRenderCommands(uint32_t scratch_address, Clay_RenderCommandArray cmds) {
+    if (scratch_address == 0) {
+        return;
+    }
+
+    uint8_t* base = (uint8_t*)(uintptr_t)scratch_address;
+    uint32_t len = (uint32_t)cmds.length;
+
+    // Header
+    // u32 length
+    // u32 command_size
+    // u32 commands_ptr
+    // u32 reserved
+    write_u32(base + 0, len);
+    write_u32(base + 4, TXXT_PACKED_CMD_SIZE);
+    write_u32(base + 8, scratch_address + TXXT_PACKED_HDR_SIZE);
+    write_u32(base + 12, 0);
+
+    uint8_t* out = base + TXXT_PACKED_HDR_SIZE;
+    for (uint32_t i = 0; i < len; i++) {
+        Clay_RenderCommand* cmd = &cmds.internalArray[i];
+        uint8_t* c = out + (i * TXXT_PACKED_CMD_SIZE);
+
+        // Zero the whole command.
+        for (uint32_t j = 0; j < TXXT_PACKED_CMD_SIZE; j++) {
+            c[j] = 0;
+        }
+
+        c[0] = (uint8_t)cmd->commandType;
+        c[1] = 0;
+        write_i16(c + 2, cmd->zIndex);
+
+        write_f32(c + 4, cmd->boundingBox.x);
+        write_f32(c + 8, cmd->boundingBox.y);
+        write_f32(c + 12, cmd->boundingBox.width);
+        write_f32(c + 16, cmd->boundingBox.height);
+
+        // Payload starts at offset 20.
+        switch (cmd->commandType) {
+            case CLAY_RENDER_COMMAND_TYPE_RECTANGLE: {
+                Clay_RectangleRenderData* r = &cmd->renderData.rectangle;
+                write_f32(c + 20, r->backgroundColor.r);
+                write_f32(c + 24, r->backgroundColor.g);
+                write_f32(c + 28, r->backgroundColor.b);
+                write_f32(c + 32, r->backgroundColor.a);
+
+                write_f32(c + 36, r->cornerRadius.topLeft);
+                write_f32(c + 40, r->cornerRadius.topRight);
+                write_f32(c + 44, r->cornerRadius.bottomRight);
+                write_f32(c + 48, r->cornerRadius.bottomLeft);
+                break;
+            }
+
+            case CLAY_RENDER_COMMAND_TYPE_TEXT: {
+                Clay_TextRenderData* t = &cmd->renderData.text;
+                // stringContents: length + chars pointer
+                write_u32(c + 20, (uint32_t)(uintptr_t)t->stringContents.chars);
+                write_u32(c + 24, (uint32_t)t->stringContents.length);
+                write_u16(c + 28, t->fontId);
+                write_u16(c + 30, t->fontSize);
+                write_u16(c + 32, t->letterSpacing);
+                write_u16(c + 34, t->lineHeight);
+
+                write_f32(c + 36, t->textColor.r);
+                write_f32(c + 40, t->textColor.g);
+                write_f32(c + 44, t->textColor.b);
+                write_f32(c + 48, t->textColor.a);
+                break;
+            }
+
+            case CLAY_RENDER_COMMAND_TYPE_BORDER: {
+                Clay_BorderRenderData* b = &cmd->renderData.border;
+                write_f32(c + 20, b->color.r);
+                write_f32(c + 24, b->color.g);
+                write_f32(c + 28, b->color.b);
+                write_f32(c + 32, b->color.a);
+
+                write_f32(c + 36, b->cornerRadius.topLeft);
+                write_f32(c + 40, b->cornerRadius.topRight);
+                write_f32(c + 44, b->cornerRadius.bottomRight);
+                write_f32(c + 48, b->cornerRadius.bottomLeft);
+
+                write_u16(c + 52, b->width.left);
+                write_u16(c + 54, b->width.right);
+                write_u16(c + 56, b->width.top);
+                write_u16(c + 58, b->width.bottom);
+                write_u16(c + 60, b->width.betweenChildren);
+                write_u16(c + 62, 0);
+                break;
+            }
+
+            case CLAY_RENDER_COMMAND_TYPE_IMAGE: {
+                Clay_ImageRenderData* im = &cmd->renderData.image;
+                write_f32(c + 20, im->backgroundColor.r);
+                write_f32(c + 24, im->backgroundColor.g);
+                write_f32(c + 28, im->backgroundColor.b);
+                write_f32(c + 32, im->backgroundColor.a);
+
+                write_f32(c + 36, im->cornerRadius.topLeft);
+                write_f32(c + 40, im->cornerRadius.topRight);
+                write_f32(c + 44, im->cornerRadius.bottomRight);
+                write_f32(c + 48, im->cornerRadius.bottomLeft);
+
+                write_u32(c + 52, (uint32_t)(uintptr_t)im->imageData);
+                break;
+            }
+
+            case CLAY_RENDER_COMMAND_TYPE_CUSTOM: {
+                Clay_CustomRenderData* cu = &cmd->renderData.custom;
+                write_f32(c + 20, cu->backgroundColor.r);
+                write_f32(c + 24, cu->backgroundColor.g);
+                write_f32(c + 28, cu->backgroundColor.b);
+                write_f32(c + 32, cu->backgroundColor.a);
+
+                write_f32(c + 36, cu->cornerRadius.topLeft);
+                write_f32(c + 40, cu->cornerRadius.topRight);
+                write_f32(c + 44, cu->cornerRadius.bottomRight);
+                write_f32(c + 48, cu->cornerRadius.bottomLeft);
+
+                write_u32(c + 52, (uint32_t)(uintptr_t)cu->customData);
+                break;
+            }
+
+            case CLAY_RENDER_COMMAND_TYPE_SCISSOR_START:
+            case CLAY_RENDER_COMMAND_TYPE_SCISSOR_END:
+            case CLAY_RENDER_COMMAND_TYPE_NONE:
+            default:
+                break;
+        }
+    }
+}
+
+CLAY_WASM_EXPORT("UpdateDrawFrame") void UpdateDrawFrame(
+    uint32_t cmd_buffer_address,
     float width, float height,
     float mouse_wheel_x, float mouse_wheel_y,
     float mouse_x, float mouse_y,
@@ -861,7 +1017,7 @@ CLAY_WASM_EXPORT("UpdateDrawFrame") Clay_RenderCommandArray UpdateDrawFrame(
 
     Clay_RenderCommandArray cmds = CreateLayout();
     UpdateLoginRects();
-    return cmds;
+    PackRenderCommands(cmd_buffer_address, cmds);
 }
 
 // JS interop functions
