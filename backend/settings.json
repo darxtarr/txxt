@@ -1,0 +1,4 @@
+{
+  "tcp_socket_binding": "0.0.0.0",
+  "tcp_socket_port": 3000
+}
