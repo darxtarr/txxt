@@ -97,10 +97,19 @@ typedef struct {
     bool logged_in;
 } AppState;
 
+typedef struct {
+    float x;
+    float y;
+    float width;
+    float height;
+} Rect;
+
 // Global state
 AppState app_state = {0};
 double window_width = 1024;
 double window_height = 768;
+
+static Rect login_rects[2] = {0};
 
 // Frame arena for temporary allocations
 typedef struct {
@@ -800,6 +809,35 @@ Clay_RenderCommandArray CreateLayout(void) {
     return Clay_EndLayout();
 }
 
+static void UpdateLoginRects(void) {
+    Clay_ElementData u = Clay_GetElementData(Clay_GetElementId(CLAY_STRING("UsernameInput")));
+    Clay_ElementData p = Clay_GetElementData(Clay_GetElementId(CLAY_STRING("PasswordInput")));
+
+    if (u.found) {
+        login_rects[0] = (Rect){
+            .x = u.boundingBox.x,
+            .y = u.boundingBox.y,
+            .width = u.boundingBox.width,
+            .height = u.boundingBox.height,
+        };
+    }
+    else {
+        login_rects[0] = (Rect){ .x = -1, .y = -1, .width = 0, .height = 0 };
+    }
+
+    if (p.found) {
+        login_rects[1] = (Rect){
+            .x = p.boundingBox.x,
+            .y = p.boundingBox.y,
+            .width = p.boundingBox.width,
+            .height = p.boundingBox.height,
+        };
+    }
+    else {
+        login_rects[1] = (Rect){ .x = -1, .y = -1, .width = 0, .height = 0 };
+    }
+}
+
 // WASM exports
 CLAY_WASM_EXPORT("SetScratchMemory") void SetScratchMemory(void* memory) {
     frame_arena.memory = memory;
@@ -821,7 +859,9 @@ CLAY_WASM_EXPORT("UpdateDrawFrame") Clay_RenderCommandArray UpdateDrawFrame(
     Clay_SetPointerState((Clay_Vector2){mouse_x, mouse_y}, mouse_down || touch_down);
     Clay_UpdateScrollContainers(touch_down, (Clay_Vector2){mouse_wheel_x, mouse_wheel_y}, delta_time);
 
-    return CreateLayout();
+    Clay_RenderCommandArray cmds = CreateLayout();
+    UpdateLoginRects();
+    return cmds;
 }
 
 // JS interop functions
@@ -873,6 +913,13 @@ CLAY_WASM_EXPORT("InitApp") void InitApp(void) {
     app_state.show_create_modal = false;
     app_state.show_detail_panel = false;
     app_state.current_user[0] = '\0';
+}
+
+CLAY_WASM_EXPORT("GetLoginRect") Rect* GetLoginRect(uint32_t which) {
+    if (which >= 2) {
+        return 0;
+    }
+    return &login_rects[which];
 }
 
 // Dummy main for WASM

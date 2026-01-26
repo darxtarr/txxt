@@ -140,7 +140,16 @@
             position: absolute;
             width: 336px;
             height: 44px;
-            background: transparent;
+        }
+
+        /* Safe defaults (even if JS positioning fails) */
+        #login-username {
+            left: calc(50% - 168px);
+            top: calc(50% - 56px);
+        }
+        #login-password {
+            left: calc(50% - 168px);
+            top: calc(50% + 8px);
         }
     </style>
 </head>
@@ -149,8 +158,8 @@
 
     <!-- Login form overlay -->
     <div id="login-overlay">
-        <input type="text" id="login-username" class="input-overlay active" placeholder="Username">
-        <input type="password" id="login-password" class="input-overlay active" placeholder="Password">
+        <input type="text" id="login-username" class="input-overlay active" placeholder="Username" autocomplete="username">
+        <input type="password" id="login-password" class="input-overlay active" placeholder="Password" autocomplete="current-password">
     </div>
 
     <!-- Create/Edit Task Modal -->
@@ -223,6 +232,21 @@
     let heapSpaceAddress = 0;
     let renderCommandSize = 0;
     let previousFrameTime = 0;
+    let canvasPixelWidth = 0;
+    let canvasPixelHeight = 0;
+    let canvasScale = 1;
+
+    // Perf HUD
+    let hudEnabled = true;
+    let hudFps = 0;
+    let hudFpsMin = 999;
+    let hudAccumMs = 0;
+    let hudFrames = 0;
+    let hudLastReportTime = 0;
+    let hudWasmMs = 0;
+    let hudDrawMs = 0;
+    let hudCmds = 0;
+    let hudTextCmds = 0;
     let authToken = localStorage.getItem('auth_token');
     let wsConnection = null;
     let appStatePtr = null;
@@ -557,6 +581,23 @@
         memoryDataView.setUint8(address + len, 0); // Null terminator
     }
 
+    function resizeCanvasIfNeeded() {
+        const canvas = window.canvasRoot;
+        const scale = window.devicePixelRatio || 1;
+        const pixelW = Math.max(1, Math.floor(window.innerWidth * scale));
+        const pixelH = Math.max(1, Math.floor(window.innerHeight * scale));
+
+        canvasScale = scale;
+        if (pixelW !== canvasPixelWidth || pixelH !== canvasPixelHeight) {
+            canvasPixelWidth = pixelW;
+            canvasPixelHeight = pixelH;
+            canvas.width = pixelW;
+            canvas.height = pixelH;
+            canvas.style.width = window.innerWidth + 'px';
+            canvas.style.height = window.innerHeight + 'px';
+        }
+    }
+
     // Canvas rendering
     function renderLoopCanvas() {
         const capacity = memoryDataView.getUint32(scratchSpaceAddress, true);
@@ -565,12 +606,13 @@
 
         const canvas = window.canvasRoot;
         const ctx = window.canvasContext;
-        const scale = window.devicePixelRatio;
+        const scale = canvasScale;
 
-        canvas.width = window.innerWidth * scale;
-        canvas.height = window.innerHeight * scale;
-        canvas.style.width = window.innerWidth + 'px';
-        canvas.style.height = window.innerHeight + 'px';
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvasPixelWidth, canvasPixelHeight);
+
+        hudCmds = length;
+        hudTextCmds = 0;
 
         for (let i = 0; i < length; i++, arrayOffset += renderCommandSize) {
             const renderCommand = readStructAtAddress(arrayOffset, renderCommandDefinition);
@@ -652,11 +694,11 @@
                 case CLAY_RENDER_COMMAND_TYPE_TEXT: {
                     const config = readStructAtAddress(renderCommand.config.value, textConfigDefinition);
                     const textContents = renderCommand.text;
+                    hudTextCmds++;
                     const stringContents = new Uint8Array(
-                        memoryDataView.buffer.slice(
-                            textContents.chars.value,
-                            textContents.chars.value + textContents.length.value
-                        )
+                        memoryDataView.buffer,
+                        textContents.chars.value,
+                        textContents.length.value
                     );
                     const text = textDecoder.decode(stringContents);
                     const fontSize = config.fontSize.value * GLOBAL_FONT_SCALING_FACTOR * scale;
@@ -693,35 +735,102 @@
                 }
             }
         }
+
+        if (hudEnabled) {
+            const pad = 10 * scale;
+            const w = 260 * scale;
+            const h = 78 * scale;
+            ctx.save();
+            ctx.fillStyle = 'rgba(0,0,0,0.55)';
+            ctx.beginPath();
+            ctx.roundRect(pad, pad, w, h, 10 * scale);
+            ctx.fill();
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(255,255,255,0.95)';
+            ctx.font = `${12 * scale}px system-ui, -apple-system, sans-serif`;
+            ctx.textBaseline = 'top';
+            const line1 = `FPS ${hudFps.toFixed(1)} (min ${hudFpsMin.toFixed(1)})`;
+            const line2 = `wasm ${hudWasmMs.toFixed(2)}ms  draw ${hudDrawMs.toFixed(2)}ms`;
+            const line3 = `cmds ${hudCmds}  text ${hudTextCmds}`;
+            ctx.fillText(line1, pad + 12 * scale, pad + 10 * scale);
+            ctx.fillText(line2, pad + 12 * scale, pad + 28 * scale);
+            ctx.fillText(line3, pad + 12 * scale, pad + 46 * scale);
+            ctx.restore();
+        }
     }
 
     // Position login inputs over Clay-rendered boxes
     function positionLoginInputs() {
         if (!instance) return;
 
-        // Center of screen calculations for login box
-        const centerX = window.innerWidth / 2;
-        const centerY = window.innerHeight / 2;
-
-        // Login box is 400px wide, inputs are full width with 32px padding
-        const inputWidth = 336;
-        const inputLeft = centerX - 168;
-
-        // Approximate positions based on login box layout
         const usernameInput = document.getElementById('login-username');
         const passwordInput = document.getElementById('login-password');
 
-        usernameInput.style.left = inputLeft + 'px';
-        usernameInput.style.top = (centerY - 20) + 'px';
+        // Prefer Clay-derived rects when available; fall back to deterministic centering.
+        if (instance.exports.GetLoginRect) {
+            const rectPtrU = instance.exports.GetLoginRect(0);
+            const rectPtrP = instance.exports.GetLoginRect(1);
+            if (rectPtrU && rectPtrP) {
+                const ux = memoryDataView.getFloat32(rectPtrU + 0, true);
+                const uy = memoryDataView.getFloat32(rectPtrU + 4, true);
+                const uw = memoryDataView.getFloat32(rectPtrU + 8, true);
+                const uh = memoryDataView.getFloat32(rectPtrU + 12, true);
 
-        passwordInput.style.left = inputLeft + 'px';
-        passwordInput.style.top = (centerY + 40) + 'px';
+                const px = memoryDataView.getFloat32(rectPtrP + 0, true);
+                const py = memoryDataView.getFloat32(rectPtrP + 4, true);
+                const pw = memoryDataView.getFloat32(rectPtrP + 8, true);
+                const ph = memoryDataView.getFloat32(rectPtrP + 12, true);
+
+                const sane =
+                    Number.isFinite(ux) && Number.isFinite(uy) && Number.isFinite(uw) && Number.isFinite(uh) &&
+                    Number.isFinite(px) && Number.isFinite(py) && Number.isFinite(pw) && Number.isFinite(ph) &&
+                    uw > 10 && uh > 10 && pw > 10 && ph > 10;
+
+                if (sane) {
+                    usernameInput.style.left = ux + 'px';
+                    usernameInput.style.top = uy + 'px';
+                    usernameInput.style.width = uw + 'px';
+                    usernameInput.style.height = uh + 'px';
+
+                    passwordInput.style.left = px + 'px';
+                    passwordInput.style.top = py + 'px';
+                    passwordInput.style.width = pw + 'px';
+                    passwordInput.style.height = ph + 'px';
+                    return;
+                }
+            }
+        }
+
+        const boxW = 400;
+        const padX = 32;
+        const inputW = boxW - padX * 2;
+        const centerX = window.innerWidth / 2;
+        const centerY = window.innerHeight / 2;
+        const left = Math.round(centerX - inputW / 2);
+        const rowH = 44;
+        const gap = 16;
+        const topU = Math.round(centerY - rowH - gap / 2);
+        const topP = Math.round(centerY + gap / 2);
+
+        usernameInput.style.left = left + 'px';
+        usernameInput.style.top = topU + 'px';
+        usernameInput.style.width = inputW + 'px';
+        usernameInput.style.height = rowH + 'px';
+
+        passwordInput.style.left = left + 'px';
+        passwordInput.style.top = topP + 'px';
+        passwordInput.style.width = inputW + 'px';
+        passwordInput.style.height = rowH + 'px';
     }
 
     // Main render loop
     function renderLoop(currentTime) {
         const elapsed = currentTime - previousFrameTime;
         previousFrameTime = currentTime;
+
+        resizeCanvasIfNeeded();
+
+        const wasmStart = performance.now();
 
         instance.exports.UpdateDrawFrame(
             scratchSpaceAddress,
@@ -736,7 +845,29 @@
             elapsed / 1000
         );
 
+        hudWasmMs = performance.now() - wasmStart;
+
+        const drawStart = performance.now();
+
         renderLoopCanvas();
+
+        hudDrawMs = performance.now() - drawStart;
+
+        // FPS aggregation
+        const fpsNow = elapsed > 0 ? (1000 / elapsed) : 0;
+        hudAccumMs += elapsed;
+        hudFrames += 1;
+        if (fpsNow > 0) {
+            hudFpsMin = Math.min(hudFpsMin, fpsNow);
+        }
+        if (currentTime - hudLastReportTime >= 500) {
+            const avgFps = hudAccumMs > 0 ? (hudFrames * 1000 / hudAccumMs) : 0;
+            hudFps = hudFps ? (hudFps * 0.5 + avgFps * 0.5) : avgFps;
+            hudAccumMs = 0;
+            hudFrames = 0;
+            hudLastReportTime = currentTime;
+            hudFpsMin = 999;
+        }
 
         // Check if we need to show create modal
         if (instance.exports.GetShowCreateModal()) {
@@ -775,6 +906,8 @@
         window.touchDown = false;
         window.mouseDown = false;
 
+        let loginFocusInitialized = false;
+
         // Event listeners
         let wheelTimeout = null;
         document.addEventListener('wheel', (e) => {
@@ -794,6 +927,12 @@
 
         document.addEventListener('mousedown', () => {
             window.mouseDown = true;
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'F2') {
+                hudEnabled = !hudEnabled;
+            }
         });
 
         document.addEventListener('touchstart', (e) => {
@@ -816,6 +955,11 @@
         });
 
         // Login form handling
+        document.getElementById('login-username').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                document.getElementById('login-password').focus();
+            }
+        });
         document.getElementById('login-password').addEventListener('keypress', async (e) => {
             if (e.key === 'Enter') {
                 const username = document.getElementById('login-username').value;
@@ -854,16 +998,19 @@
                     const stringLength = memoryDataView.getUint32(textToMeasure, true);
                     const pointerToString = memoryDataView.getUint32(textToMeasure + 4, true);
                     const textConfig = readStructAtAddress(addressOfConfig, textConfigDefinition);
-                    const text = textDecoder.decode(
-                        memoryDataView.buffer.slice(pointerToString, pointerToString + stringLength)
-                    );
+                    const bytes = new Uint8Array(memoryDataView.buffer, pointerToString, stringLength);
+                    const text = textDecoder.decode(bytes);
                     const dimensions = getTextDimensions(
                         text,
                         `${Math.round(textConfig.fontSize.value * GLOBAL_FONT_SCALING_FACTOR)}px ${fontsById[textConfig.fontId.value] || 'sans-serif'}`
                     );
                     memoryDataView.setFloat32(addressOfDimensions, dimensions.width, true);
                     memoryDataView.setFloat32(addressOfDimensions + 4, dimensions.height, true);
-                }
+                },
+
+                // Clay declares this import for optional external scroll handling.
+                // We don't use external scroll handling, but the import must exist for instantiation.
+                queryScrollOffsetFunction: (..._args) => 0n,
             }
         };
 
@@ -892,6 +1039,8 @@
 
         renderCommandSize = getStructTotalSize(renderCommandDefinition);
 
+        resizeCanvasIfNeeded();
+
         // Check for existing auth token
         if (authToken) {
             try {
@@ -905,7 +1054,17 @@
             }
         }
 
+        // If we start on the login screen, focus the username field once.
+        if (!authToken && !loginFocusInitialized) {
+            loginFocusInitialized = true;
+            document.getElementById('login-username').focus();
+        }
+
         // Start render loop
+        // Position login inputs immediately (before first frame) if needed.
+        if (!authToken) {
+            positionLoginInputs();
+        }
         requestAnimationFrame(renderLoop);
     }
 

@@ -5,6 +5,13 @@ backend/target/
 # Database
 *.redb
 
+# Temp
+tmp/**
+!tmp/.gitkeep
+
+# Tool scratch (keep prompt, ignore artifacts)
+.opencode/tmp/**
+
 # IDE
 .vscode/
 .idea/
