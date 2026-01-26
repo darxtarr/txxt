@@ -1,4 +1,4 @@
-# Task Tracker (txxt)
+# Txx Tracker (txxt)
 
 Multi-user task tracking app with Clay/WASM frontend and Rust backend.
 
