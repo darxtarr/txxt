@@ -4,37 +4,38 @@ Multi-user task tracking app with Clay/WASM frontend and Rust backend.
 
 ## Project Status
 
-**Phase 1 (Skeleton) - IN PROGRESS**
+**Phase 1-3 COMPLETE - Backend and Frontend builds working**
 
 ### Completed:
 - [x] Project structure created
-- [x] `frontend/clay.h` - Clay UI library copied
+- [x] `frontend/clay.h` - Clay UI library
 - [x] `frontend/build.sh` - WASM build script
-- [x] `frontend/main.c` - Clay UI implementation (~700 lines)
-  - Login screen
-  - Sidebar with status filters
-  - Task list with cards
+- [x] `frontend/main.c` - Clay UI implementation (~875 lines)
+  - Login screen with input placeholders
+  - Sidebar with status filters (All/Pending/In Progress/Completed)
+  - Task list with cards showing priority, status, due date
   - Task detail panel
   - Click handling infrastructure
   - State management
-- [x] `frontend/dist/index.html` - Canvas2D renderer + JS glue (~600 lines)
+- [x] `frontend/dist/index.html` - Canvas2D renderer + JS glue (~700 lines)
   - WASM loading and Clay initialization
-  - Canvas rendering loop
+  - Canvas rendering loop (software-rendering compatible)
   - API client functions (login, CRUD tasks)
   - WebSocket connection for real-time updates
-  - Modal for task creation
+  - Modal for task creation (HTML overlay)
   - Input overlay system for login
-- [x] `backend/Cargo.toml` - Rust dependencies configured
+- [x] `frontend/dist/app.wasm` - Compiled WASM (117KB)
+- [x] `backend/Cargo.toml` - Rust dependencies
+- [x] `backend/src/main.rs` - Server entry, static file serving
+- [x] `backend/src/models.rs` - Task, User, API types, WebSocket messages
+- [x] `backend/src/db.rs` - redb storage with CRUD operations
+- [x] `backend/src/auth.rs` - JWT authentication, argon2 password hashing
+- [x] `backend/src/api.rs` - REST endpoints with broadcast
+- [x] `backend/src/ws.rs` - WebSocket handler for real-time sync
 
 ### TODO:
-- [ ] `backend/src/main.rs` - Server entry point
-- [ ] `backend/src/models.rs` - Data structures
-- [ ] `backend/src/db.rs` - redb storage layer
-- [ ] `backend/src/auth.rs` - JWT authentication
-- [ ] `backend/src/api.rs` - REST endpoints
-- [ ] `backend/src/ws.rs` - WebSocket handler
-- [ ] Build and test WASM compilation
 - [ ] Test end-to-end flow
+- [ ] Polish and bug fixes
 
 ## Stack
 
