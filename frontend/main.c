@@ -1,6 +1,25 @@
 #define CLAY_IMPLEMENTATION
 #include "clay.h"
 
+// Provide strlen for -nostdlib builds
+unsigned long strlen(const char* str) {
+    unsigned long len = 0;
+    while (str && str[len]) len++;
+    return len;
+}
+
+// Helper to get string length
+static inline uint32_t str_len(const char* str) {
+    uint32_t len = 0;
+    while (str && str[len]) len++;
+    return len;
+}
+
+// Create Clay_String from char pointer
+static inline Clay_String make_string(const char* str) {
+    return (Clay_String){ .length = str_len(str), .chars = str };
+}
+
 // Font IDs
 const uint32_t FONT_ID_BODY_16 = 0;
 const uint32_t FONT_ID_BODY_20 = 1;
@@ -45,7 +64,7 @@ typedef enum {
     PRIORITY_URGENT = 3
 } Priority;
 
-// Task data structure (simplified for display)
+// Task data structure
 typedef struct {
     uint32_t id;
     char title[128];
@@ -76,9 +95,6 @@ typedef struct {
     bool show_create_modal;
     bool show_detail_panel;
     bool logged_in;
-    // Input state - managed by JS
-    char input_title[256];
-    char input_description[2048];
 } AppState;
 
 // Global state
@@ -93,6 +109,10 @@ typedef struct {
 } Arena;
 
 Arena frame_arena = {0};
+
+// Static strings for status/priority
+static const char* STATUS_STRINGS[] = {"Pending", "In Progress", "Completed"};
+static const char* PRIORITY_STRINGS[] = {"Low", "Medium", "High", "Urgent"};
 
 // Helper to get priority color
 Clay_Color GetPriorityColor(Priority p) {
@@ -115,29 +135,10 @@ Clay_Color GetStatusColor(TaskStatus s) {
     }
 }
 
-const char* GetStatusText(TaskStatus s) {
-    switch (s) {
-        case STATUS_PENDING: return "Pending";
-        case STATUS_IN_PROGRESS: return "In Progress";
-        case STATUS_COMPLETED: return "Completed";
-        default: return "Unknown";
-    }
-}
-
-const char* GetPriorityText(Priority p) {
-    switch (p) {
-        case PRIORITY_LOW: return "Low";
-        case PRIORITY_MEDIUM: return "Medium";
-        case PRIORITY_HIGH: return "High";
-        case PRIORITY_URGENT: return "Urgent";
-        default: return "Unknown";
-    }
-}
-
 // Custom element data for click handling
 typedef struct {
     int32_t task_index;
-    int32_t action_type; // 0=select, 1=create, 2=close_detail, 3=filter, 4=status_change
+    int32_t action_type;
     int32_t action_data;
 } ClickData;
 
@@ -149,22 +150,18 @@ ClickData* AllocateClickData(ClickData data) {
 }
 
 // Handle click interaction
-void HandleTaskClick(Clay_ElementId elementId, Clay_PointerData pointerInfo, void *userData) {
+void HandleClick(Clay_ElementId elementId, Clay_PointerData pointerInfo, void *userData) {
     ClickData* data = (ClickData*)userData;
     if (pointerInfo.state == CLAY_POINTER_DATA_PRESSED_THIS_FRAME) {
         if (data->action_type == 0) {
-            // Select task
             app_state.selected_task_index = data->task_index;
             app_state.show_detail_panel = true;
         } else if (data->action_type == 1) {
-            // Open create modal
             app_state.show_create_modal = true;
         } else if (data->action_type == 2) {
-            // Close detail panel
             app_state.show_detail_panel = false;
             app_state.selected_task_index = -1;
         } else if (data->action_type == 3) {
-            // Change filter
             app_state.filter_status = (FilterStatus)data->action_data;
         }
     }
@@ -184,8 +181,8 @@ void FilterButton(const char* label, FilterStatus filter_value, int index) {
         .backgroundColor = bg_color,
         .cornerRadius = CLAY_CORNER_RADIUS(6)
     }) {
-        Clay_OnHover(HandleTaskClick, AllocateClickData((ClickData){0, 3, filter_value}));
-        CLAY_TEXT(CLAY_STRING(label), CLAY_TEXT_CONFIG({
+        Clay_OnHover(HandleClick, AllocateClickData((ClickData){0, 3, filter_value}));
+        CLAY_TEXT(make_string(label), CLAY_TEXT_CONFIG({
             .fontSize = 14,
             .fontId = FONT_ID_BODY_16,
             .textColor = COLOR_TEXT_WHITE
@@ -253,7 +250,7 @@ void Sidebar(void) {
         }) {}
 
         // User info
-        if (app_state.logged_in) {
+        if (app_state.logged_in && app_state.current_user[0] != '\0') {
             CLAY(CLAY_ID("UserInfo"), {
                 .layout = {
                     .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(50) },
@@ -264,14 +261,13 @@ void Sidebar(void) {
                 .backgroundColor = (Clay_Color){45, 50, 60, 255},
                 .cornerRadius = CLAY_CORNER_RADIUS(6)
             }) {
-                // User avatar placeholder
                 CLAY(CLAY_ID("UserAvatar"), {
                     .layout = { .sizing = { CLAY_SIZING_FIXED(32), CLAY_SIZING_FIXED(32) } },
                     .backgroundColor = COLOR_PRIMARY,
                     .cornerRadius = CLAY_CORNER_RADIUS(16)
                 }) {}
 
-                CLAY_TEXT(CLAY_STRING(app_state.current_user), CLAY_TEXT_CONFIG({
+                CLAY_TEXT(make_string(app_state.current_user), CLAY_TEXT_CONFIG({
                     .fontSize = 14,
                     .fontId = FONT_ID_BODY_16,
                     .textColor = COLOR_TEXT_WHITE
@@ -299,7 +295,7 @@ void TaskCard(Task* task, int index) {
         .cornerRadius = CLAY_CORNER_RADIUS(8),
         .border = { .width = { 1, 1, 1, 1 }, .color = border_color }
     }) {
-        Clay_OnHover(HandleTaskClick, AllocateClickData((ClickData){index, 0, 0}));
+        Clay_OnHover(HandleClick, AllocateClickData((ClickData){index, 0, 0}));
 
         // Top row: Title + Priority
         CLAY(CLAY_IDI("TaskCardTop", index), {
@@ -317,7 +313,7 @@ void TaskCard(Task* task, int index) {
             }) {}
 
             // Title
-            CLAY_TEXT(CLAY_STRING(task->title), CLAY_TEXT_CONFIG({
+            CLAY_TEXT(make_string(task->title), CLAY_TEXT_CONFIG({
                 .fontSize = 16,
                 .fontId = FONT_ID_BODY_20,
                 .textColor = COLOR_TEXT
@@ -326,7 +322,7 @@ void TaskCard(Task* task, int index) {
 
         // Description preview
         if (task->description[0] != '\0') {
-            CLAY_TEXT(CLAY_STRING(task->description), CLAY_TEXT_CONFIG({
+            CLAY_TEXT(make_string(task->description), CLAY_TEXT_CONFIG({
                 .fontSize = 14,
                 .fontId = FONT_ID_BODY_16,
                 .textColor = COLOR_TEXT_LIGHT
@@ -350,7 +346,7 @@ void TaskCard(Task* task, int index) {
                 .backgroundColor = GetStatusColor(task->status),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
-                CLAY_TEXT(CLAY_STRING(GetStatusText(task->status)), CLAY_TEXT_CONFIG({
+                CLAY_TEXT(make_string(STATUS_STRINGS[task->status]), CLAY_TEXT_CONFIG({
                     .fontSize = 12,
                     .fontId = FONT_ID_BODY_16,
                     .textColor = COLOR_TEXT_WHITE
@@ -364,7 +360,7 @@ void TaskCard(Task* task, int index) {
 
             // Due date
             if (task->due_date[0] != '\0') {
-                CLAY_TEXT(CLAY_STRING(task->due_date), CLAY_TEXT_CONFIG({
+                CLAY_TEXT(make_string(task->due_date), CLAY_TEXT_CONFIG({
                     .fontSize = 12,
                     .fontId = FONT_ID_BODY_16,
                     .textColor = COLOR_TEXT_LIGHT
@@ -415,7 +411,7 @@ void TaskList(void) {
                 .backgroundColor = Clay_Hovered() ? COLOR_PRIMARY_HOVER : COLOR_PRIMARY,
                 .cornerRadius = CLAY_CORNER_RADIUS(6)
             }) {
-                Clay_OnHover(HandleTaskClick, AllocateClickData((ClickData){0, 1, 0}));
+                Clay_OnHover(HandleClick, AllocateClickData((ClickData){0, 1, 0}));
                 CLAY_TEXT(CLAY_STRING("+ New Task"), CLAY_TEXT_CONFIG({
                     .fontSize = 14,
                     .fontId = FONT_ID_BODY_16,
@@ -424,8 +420,8 @@ void TaskList(void) {
             }
         }
 
-        // Task count
-        CLAY_TEXT(CLAY_STRING("Showing all tasks"), CLAY_TEXT_CONFIG({
+        // Task count info
+        CLAY_TEXT(CLAY_STRING("Click a task to view details"), CLAY_TEXT_CONFIG({
             .fontSize = 14,
             .fontId = FONT_ID_BODY_16,
             .textColor = COLOR_TEXT_LIGHT
@@ -440,41 +436,34 @@ void TaskList(void) {
             },
             .clip = { .vertical = true, .childOffset = Clay_GetScrollOffset() }
         }) {
-            // Render filtered tasks
+            int shown = 0;
             for (uint32_t i = 0; i < app_state.task_count; i++) {
                 Task* task = &app_state.tasks[i];
 
                 // Apply filter
                 bool show = false;
                 switch (app_state.filter_status) {
-                    case FILTER_ALL:
-                        show = true;
-                        break;
-                    case FILTER_PENDING:
-                        show = (task->status == STATUS_PENDING);
-                        break;
-                    case FILTER_IN_PROGRESS:
-                        show = (task->status == STATUS_IN_PROGRESS);
-                        break;
-                    case FILTER_COMPLETED:
-                        show = (task->status == STATUS_COMPLETED);
-                        break;
+                    case FILTER_ALL: show = true; break;
+                    case FILTER_PENDING: show = (task->status == STATUS_PENDING); break;
+                    case FILTER_IN_PROGRESS: show = (task->status == STATUS_IN_PROGRESS); break;
+                    case FILTER_COMPLETED: show = (task->status == STATUS_COMPLETED); break;
                 }
 
                 if (show) {
                     TaskCard(task, i);
+                    shown++;
                 }
             }
 
             // Empty state
-            if (app_state.task_count == 0) {
+            if (shown == 0) {
                 CLAY(CLAY_ID("EmptyState"), {
                     .layout = {
                         .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(200) },
                         .childAlignment = { CLAY_ALIGN_X_CENTER, CLAY_ALIGN_Y_CENTER }
                     }
                 }) {
-                    CLAY_TEXT(CLAY_STRING("No tasks yet. Create one!"), CLAY_TEXT_CONFIG({
+                    CLAY_TEXT(CLAY_STRING("No tasks found. Create one!"), CLAY_TEXT_CONFIG({
                         .fontSize = 16,
                         .fontId = FONT_ID_BODY_16,
                         .textColor = COLOR_TEXT_LIGHT
@@ -487,7 +476,8 @@ void TaskList(void) {
 
 // Detail panel
 void DetailPanel(void) {
-    if (!app_state.show_detail_panel || app_state.selected_task_index < 0) {
+    if (!app_state.show_detail_panel || app_state.selected_task_index < 0 ||
+        app_state.selected_task_index >= (int32_t)app_state.task_count) {
         return;
     }
 
@@ -516,7 +506,6 @@ void DetailPanel(void) {
                 .textColor = COLOR_TEXT
             }));
 
-            // Spacer
             CLAY(CLAY_ID("DetailHeaderSpacer"), {
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } }
             }) {}
@@ -530,7 +519,7 @@ void DetailPanel(void) {
                 .backgroundColor = Clay_Hovered() ? (Clay_Color){240, 240, 245, 255} : COLOR_WHITE,
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
-                Clay_OnHover(HandleTaskClick, AllocateClickData((ClickData){0, 2, 0}));
+                Clay_OnHover(HandleClick, AllocateClickData((ClickData){0, 2, 0}));
                 CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({
                     .fontSize = 16,
                     .fontId = FONT_ID_BODY_16,
@@ -558,7 +547,7 @@ void DetailPanel(void) {
                 .fontId = FONT_ID_BODY_16,
                 .textColor = COLOR_TEXT_LIGHT
             }));
-            CLAY_TEXT(CLAY_STRING(task->title), CLAY_TEXT_CONFIG({
+            CLAY_TEXT(make_string(task->title), CLAY_TEXT_CONFIG({
                 .fontSize = 18,
                 .fontId = FONT_ID_BODY_20,
                 .textColor = COLOR_TEXT
@@ -578,7 +567,7 @@ void DetailPanel(void) {
                 .fontId = FONT_ID_BODY_16,
                 .textColor = COLOR_TEXT_LIGHT
             }));
-            CLAY_TEXT(CLAY_STRING(task->description[0] ? task->description : "No description"), CLAY_TEXT_CONFIG({
+            CLAY_TEXT(make_string(task->description[0] ? task->description : "No description"), CLAY_TEXT_CONFIG({
                 .fontSize = 14,
                 .fontId = FONT_ID_BODY_16,
                 .textColor = COLOR_TEXT
@@ -606,7 +595,7 @@ void DetailPanel(void) {
                 .backgroundColor = GetStatusColor(task->status),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
-                CLAY_TEXT(CLAY_STRING(GetStatusText(task->status)), CLAY_TEXT_CONFIG({
+                CLAY_TEXT(make_string(STATUS_STRINGS[task->status]), CLAY_TEXT_CONFIG({
                     .fontSize = 14,
                     .fontId = FONT_ID_BODY_16,
                     .textColor = COLOR_TEXT_WHITE
@@ -639,7 +628,7 @@ void DetailPanel(void) {
                     .backgroundColor = GetPriorityColor(task->priority),
                     .cornerRadius = CLAY_CORNER_RADIUS(5)
                 }) {}
-                CLAY_TEXT(CLAY_STRING(GetPriorityText(task->priority)), CLAY_TEXT_CONFIG({
+                CLAY_TEXT(make_string(PRIORITY_STRINGS[task->priority]), CLAY_TEXT_CONFIG({
                     .fontSize = 14,
                     .fontId = FONT_ID_BODY_16,
                     .textColor = COLOR_TEXT
@@ -661,7 +650,7 @@ void DetailPanel(void) {
                     .fontId = FONT_ID_BODY_16,
                     .textColor = COLOR_TEXT_LIGHT
                 }));
-                CLAY_TEXT(CLAY_STRING(task->due_date), CLAY_TEXT_CONFIG({
+                CLAY_TEXT(make_string(task->due_date), CLAY_TEXT_CONFIG({
                     .fontSize = 14,
                     .fontId = FONT_ID_BODY_16,
                     .textColor = COLOR_TEXT
@@ -683,7 +672,7 @@ void DetailPanel(void) {
                     .fontId = FONT_ID_BODY_16,
                     .textColor = COLOR_TEXT_LIGHT
                 }));
-                CLAY_TEXT(CLAY_STRING(task->assigned_to), CLAY_TEXT_CONFIG({
+                CLAY_TEXT(make_string(task->assigned_to), CLAY_TEXT_CONFIG({
                     .fontSize = 14,
                     .fontId = FONT_ID_BODY_16,
                     .textColor = COLOR_TEXT
@@ -726,7 +715,7 @@ void LoginScreen(void) {
                 .textColor = COLOR_TEXT_LIGHT
             }));
 
-            // Username input placeholder (actual input is HTML overlay)
+            // Username input placeholder
             CLAY(CLAY_ID("UsernameInput"), {
                 .layout = {
                     .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(44) },
@@ -844,10 +833,6 @@ CLAY_WASM_EXPORT("SetLoggedIn") void SetLoggedIn(bool logged_in) {
     app_state.logged_in = logged_in;
 }
 
-CLAY_WASM_EXPORT("SetCurrentUser") void SetCurrentUser(const char* username) {
-    // Copy username (JS will write directly to memory)
-}
-
 CLAY_WASM_EXPORT("AddTask") void AddTask(
     uint32_t id,
     uint32_t status,
@@ -876,7 +861,7 @@ CLAY_WASM_EXPORT("GetSelectedTaskIndex") int32_t GetSelectedTaskIndex(void) {
 
 CLAY_WASM_EXPORT("GetShowCreateModal") bool GetShowCreateModal(void) {
     bool result = app_state.show_create_modal;
-    app_state.show_create_modal = false; // Auto-reset
+    app_state.show_create_modal = false;
     return result;
 }
 
@@ -887,6 +872,7 @@ CLAY_WASM_EXPORT("InitApp") void InitApp(void) {
     app_state.filter_status = FILTER_ALL;
     app_state.show_create_modal = false;
     app_state.show_detail_panel = false;
+    app_state.current_user[0] = '\0';
 }
 
 // Dummy main for WASM
