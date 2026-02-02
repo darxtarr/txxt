@@ -6,7 +6,13 @@ const SETTINGS_FILENAME: &str = "settings.json";
 #[derive(Debug, Deserialize)]
 pub struct Settings {
     pub tcp_socket_binding: String,
-    pub tcp_socket_port: u16
+    pub tcp_socket_port: u16,
+    pub jwt_secret: String,
+    pub jwt_expiration_in_minutes: u16,
+    pub redb_file_path: String,
+    pub default_admin_username: String,
+    pub default_admin_password: String,
+    pub default_admin_email: String
 }
 
 impl Settings {

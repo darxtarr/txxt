@@ -1,4 +1,10 @@
 {
   "tcp_socket_binding": "0.0.0.0",
-  "tcp_socket_port": 3000
+  "tcp_socket_port": 3000,
+  "jwt_secret": "SuperSecretHashedValue123",
+  "jwt_expiration_in_minutes": 120,
+  "redb_file_path": "txxtDb.redb",
+  "default_admin_username": "admin",
+  "default_admin_password": "admin",
+  "default_admin_email": "default@admin.com"
 }
