@@ -124,33 +124,72 @@ redb is a save file. The server does NOT query redb at runtime.
 - Crash recovery: reboot, reload from redb (ACID guarantees)
 - redb transactions are cheap for single writes at this scale
 
-## Protocol — WebSocket only for data
+## Protocol — WebSocket binary (implemented)
 
-### Client → Server (commands)
+All data over WebSocket uses fixed-stride packed binary, readable by JS
+DataView at known offsets. See `backend/src/wire.rs` for the authoritative
+byte layout. JSON is never used in the data path.
 
-```
-MoveTask     { task_id, day, start_time, duration }
-CreateTask   { title, service_id, ... }
-UpdateTask   { task_id, fields... }
-DeleteTask   { task_id }
-Subscribe    { view: WeekView | DayView, week_start }
-```
-
-### Server → Client (events)
+### Task record (192 bytes, fixed stride)
 
 ```
-Snapshot     { revision, tasks[], services[], users[] }
-TaskMoved    { revision, task_id, day, start_time, duration }
-TaskCreated  { revision, task }
-TaskUpdated  { revision, task_id, fields... }
-TaskDeleted  { revision, task_id }
+[0..16]    id (UUID, 16 bytes)
+[16]       status (u8: 0=Staged, 1=Scheduled, 2=Active, 3=Completed)
+[17]       priority (u8: 0=Low, 1=Medium, 2=High, 3=Urgent)
+[18]       day (u8: 0-6 Mon-Sun, 0xFF = not scheduled)
+[19]       _pad
+[20..22]   start_time (u16 LE, minutes from midnight, 15-min grid)
+[22..24]   duration (u16 LE, minutes, 15-min grid)
+[24..40]   service_id (UUID, 16 bytes)
+[40..56]   assigned_to (UUID, 16 bytes, zeroed = unassigned)
+[56..184]  title (128 bytes, UTF-8, zero-padded)
+[184..192] _reserved
 ```
 
-All binary. Packed structs. Readable by JS DataView at known offsets.
+### Service record (80 bytes, fixed stride)
+
+```
+[0..16]    id (UUID, 16 bytes)
+[16..80]   name (64 bytes, UTF-8, zero-padded)
+```
+
+### Server → Client messages
+
+First byte is message type:
+- `0x01` Snapshot: `[type][rev:u64][task_count:u32][svc_count:u32][tasks...][services...]`
+- `0x02` TaskCreated: `[type][rev:u64][task_record:192]`
+- `0x03` TaskScheduled: `[type][rev:u64][task_id:16][day:u8][start:u16][dur:u16]`
+- `0x04` TaskMoved: same layout as TaskScheduled
+- `0x05` TaskUnscheduled: `[type][rev:u64][task_id:16]`
+- `0x06` TaskCompleted: `[type][rev:u64][task_id:16]`
+- `0x07` TaskDeleted: `[type][rev:u64][task_id:16]`
+
+### Client → Server commands
+
+- `0x10` CreateTask: `[type][priority:u8][service_id:16][assigned_to:16][title:UTF-8...]`
+- `0x11` ScheduleTask: `[type][task_id:16][day:u8][start:u16][dur:u16]`
+- `0x12` MoveTask: same layout as ScheduleTask
+- `0x13` UnscheduleTask: `[type][task_id:16]`
+- `0x14` CompleteTask: `[type][task_id:16]`
+- `0x15` DeleteTask: `[type][task_id:16]`
+
+### JS reading example
+
+```javascript
+const view = new DataView(buffer);
+// In a snapshot, task records start at offset 17
+const TASK_STRIDE = 192;
+const taskOffset = 17 + (i * TASK_STRIDE);
+const status    = view.getUint8(taskOffset + 16);
+const priority  = view.getUint8(taskOffset + 17);
+const day       = view.getUint8(taskOffset + 18);
+const startTime = view.getUint16(taskOffset + 20, true);  // LE
+const duration  = view.getUint16(taskOffset + 22, true);  // LE
+```
 
 ### Sync semantics
 
-- Every event carries a revision number
+- Every event carries a revision number (u64 LE at offset 1)
 - Client tracks last_seen_rev
 - On reconnect: client sends last_seen_rev, server sends deltas since then
   (or full snapshot if gap is too large)

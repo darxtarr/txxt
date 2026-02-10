@@ -1,13 +1,13 @@
 //! Game WebSocket handler.
 //!
-//! Binary protocol over WebSocket:
-//! - Client sends: postcard-encoded Command
-//! - Server sends: postcard-encoded ServerMsg (Snapshot on connect, then Events)
+//! Binary protocol over WebSocket using fixed-stride packed records.
+//! See wire.rs for the byte layout — readable by JS DataView at known offsets.
 //!
-//! This is interim — Phase 4 will use fixed-stride packed structs for IRONCLAD's DataView.
+//! - Client sends: packed binary commands (wire::unpack_command)
+//! - Server sends: packed binary snapshots + events (wire::pack_*)
 
 use crate::auth::SharedState;
-use crate::world::{Command, Event, Service, Task};
+use crate::wire;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -16,25 +16,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-// ── Wire messages ──────────────────────────────────────────────
-
-/// Server → Client messages (postcard-encoded, sent as binary WS frames).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ServerMsg {
-    /// Sent once on connect: the full world state.
-    Snapshot {
-        revision: u64,
-        tasks: Vec<Task>,
-        services: Vec<Service>,
-    },
-    /// A mutation that just happened. Broadcast to all clients.
-    Event(Event),
-    /// Something went wrong with the client's command.
-    Error { message: String },
-}
 
 // ── WS upgrade handler ────────────────────────────────────────
 
@@ -54,15 +36,10 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
     // This ensures we don't miss events between snapshot and subscription.
     let mut broadcast_rx = state.game_tx.subscribe();
 
-    // Step 2: Read-lock World, build snapshot, send to this client.
+    // Step 2: Read-lock World, pack binary snapshot, send to this client.
     let snapshot_bytes = {
         let world = state.world.read().unwrap();
-        let msg = ServerMsg::Snapshot {
-            revision: world.revision,
-            tasks: world.tasks.values().cloned().collect(),
-            services: world.services.values().cloned().collect(),
-        };
-        postcard::to_allocvec(&msg).unwrap()
+        wire::pack_snapshot(&world)
     };
 
     if ws_tx.send(Message::Binary(snapshot_bytes.into())).await.is_err() {
@@ -75,7 +52,7 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
         world.users.keys().next().copied().unwrap_or(Uuid::nil())
     };
 
-    // Step 3: Spawn broadcast forwarder (sends events from other commands to this client).
+    // Step 3: Spawn broadcast forwarder (sends events to this client).
     let mut send_task = tokio::spawn(async move {
         while let Ok(bytes) = broadcast_rx.recv().await {
             if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
@@ -109,16 +86,14 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
 
 // ── Command processing ─────────────────────────────────────────
 
-/// Deserialize a command, apply it to the World, flush to disk, broadcast the event.
+/// Unpack a binary command, apply it to the World, flush to disk, broadcast the event.
 /// All synchronous under the write lock — microseconds at this scale.
 fn handle_command(state: &SharedState, data: &[u8], user_id: Uuid) {
     // Deserialize
-    let cmd: Command = match postcard::from_bytes(data) {
+    let cmd = match wire::unpack_command(data) {
         Ok(cmd) => cmd,
         Err(e) => {
             eprintln!("bad command from client: {e}");
-            // Could send ServerMsg::Error back, but we'd need the sender.
-            // For now, just log and drop. The client sent garbage.
             return;
         }
     };
@@ -131,23 +106,17 @@ fn handle_command(state: &SharedState, data: &[u8], user_id: Uuid) {
                 // Flush to save file (sync, fast)
                 if let Err(e) = state.save_file.flush(&world, &event) {
                     eprintln!("save file flush failed: {e}");
-                    // World is mutated but disk is stale. At this scale,
-                    // this is a crash-level problem. Log and continue.
                 }
                 event
             }
             Err(e) => {
                 eprintln!("command rejected: {e:?}");
-                // TODO: send Error back to the specific client
                 return;
             }
         }
     };
 
-    // Broadcast to all connected clients (including the sender — they'll
-    // apply it like everyone else, keeping client logic uniform).
-    let msg = ServerMsg::Event(event);
-    if let Ok(bytes) = postcard::to_allocvec(&msg) {
-        let _ = state.game_tx.send(bytes);
-    }
+    // Broadcast packed binary event to all connected clients.
+    let bytes = wire::pack_event(&event);
+    let _ = state.game_tx.send(bytes);
 }

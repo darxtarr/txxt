@@ -1,6 +1,7 @@
 mod auth;
 mod game;
 mod persist;
+mod wire;
 mod world;
 
 use auth::{AppState, SharedState};

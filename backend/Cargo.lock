@@ -1255,7 +1255,6 @@ dependencies = [
  "postcard",
  "redb",
  "serde",
- "serde_json",
  "tokio",
  "tower-http",
  "uuid",
