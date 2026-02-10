@@ -1,6 +1,7 @@
 use crate::auth::SharedState;
 use crate::models::{
-    CreateTaskRequest, Task, TaskResponse, UpdateTaskRequest, User, UserResponse, WsMessage,
+    CreateTaskRequest, ServiceResponse, Task, TaskResponse, UpdateTaskRequest, User, UserResponse,
+    WsMessage,
 };
 use axum::{
     extract::{Path, State},
@@ -8,18 +9,12 @@ use axum::{
     Extension, Json,
 };
 use chrono::Utc;
+use std::collections::HashMap;
 use uuid::Uuid;
 
-// Helper to convert Task to TaskResponse with assigned user name
-fn task_to_response(task: Task, state: &SharedState) -> TaskResponse {
-    let assigned_to_name = task.assigned_to.and_then(|id| {
-        state
-            .db
-            .get_user(id)
-            .ok()
-            .flatten()
-            .map(|u| u.username)
-    });
+// Helper to convert Task to TaskResponse, resolving assigned user name from a cache
+fn task_to_response(task: Task, users: &HashMap<Uuid, String>) -> TaskResponse {
+    let assigned_to_name = task.assigned_to.and_then(|id| users.get(&id).cloned());
 
     TaskResponse {
         id: task.id,
@@ -28,6 +23,7 @@ fn task_to_response(task: Task, state: &SharedState) -> TaskResponse {
         status: task.status,
         priority: task.priority,
         category: task.category,
+        service_id: task.service_id,
         tags: task.tags,
         due_date: task.due_date,
         created_by: task.created_by,
@@ -36,6 +32,15 @@ fn task_to_response(task: Task, state: &SharedState) -> TaskResponse {
         created_at: task.created_at,
         updated_at: task.updated_at,
     }
+}
+
+// Load all users into a id -> username map (avoids N+1 queries)
+fn load_user_names(state: &SharedState) -> Result<HashMap<Uuid, String>, (StatusCode, String)> {
+    let users = state
+        .db
+        .list_users()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(users.into_iter().map(|u| (u.id, u.username)).collect())
 }
 
 // Broadcast a message to all WebSocket clients
@@ -54,9 +59,10 @@ pub async fn list_tasks(
         .list_tasks()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let users = load_user_names(&state)?;
     let responses: Vec<TaskResponse> = tasks
         .into_iter()
-        .map(|t| task_to_response(t, &state))
+        .map(|t| task_to_response(t, &users))
         .collect();
 
     Ok(Json(responses))
@@ -76,6 +82,7 @@ pub async fn create_task(
         status: payload.status,
         priority: payload.priority,
         category: payload.category,
+        service_id: payload.service_id,
         tags: payload.tags,
         due_date: payload.due_date,
         created_by: user.id,
@@ -89,7 +96,8 @@ pub async fn create_task(
         .create_task(&task)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let response = task_to_response(task, &state);
+    let users = load_user_names(&state)?;
+    let response = task_to_response(task, &users);
 
     // Broadcast to WebSocket clients
     broadcast(&state, WsMessage::TaskCreated { task: response.clone() });
@@ -108,7 +116,8 @@ pub async fn get_task(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Task not found".to_string()))?;
 
-    Ok(Json(task_to_response(task, &state)))
+    let users = load_user_names(&state)?;
+    Ok(Json(task_to_response(task, &users)))
 }
 
 // PUT /api/tasks/:id
@@ -139,6 +148,9 @@ pub async fn update_task(
     if let Some(category) = payload.category {
         task.category = Some(category);
     }
+    if let Some(service_id) = payload.service_id {
+        task.service_id = Some(service_id);
+    }
     if let Some(tags) = payload.tags {
         task.tags = tags;
     }
@@ -156,7 +168,8 @@ pub async fn update_task(
         .update_task(&task)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let response = task_to_response(task, &state);
+    let users = load_user_names(&state)?;
+    let response = task_to_response(task, &users);
 
     // Broadcast to WebSocket clients
     broadcast(&state, WsMessage::TaskUpdated { task: response.clone() });
@@ -194,6 +207,20 @@ pub async fn list_users(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let responses: Vec<UserResponse> = users.into_iter().map(UserResponse::from).collect();
+
+    Ok(Json(responses))
+}
+
+// GET /api/services
+pub async fn list_services(
+    State(state): State<SharedState>,
+) -> Result<Json<Vec<ServiceResponse>>, (StatusCode, String)> {
+    let services = state
+        .db
+        .list_services()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let responses: Vec<ServiceResponse> = services.into_iter().map(ServiceResponse::from).collect();
 
     Ok(Json(responses))
 }

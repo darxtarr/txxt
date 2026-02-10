@@ -1,16 +1,8 @@
 # Build outputs
-frontend/dist/app.wasm
 backend/target/
 
 # Database
 *.redb
-
-# Temp
-tmp/**
-!tmp/.gitkeep
-
-# Tool scratch (keep prompt, ignore artifacts)
-.opencode/tmp/**
 
 # IDE
 .vscode/
@@ -18,3 +10,6 @@ tmp/**
 
 # OS
 .DS_Store
+
+# Tool scratch
+.opencode/tmp/**

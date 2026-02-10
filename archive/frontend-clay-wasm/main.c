@@ -66,16 +66,57 @@ typedef enum {
 
 // Task data structure
 typedef struct {
-    uint32_t id;
+    // UUID string from backend (36 chars + NUL).
+    char id[37];
+    // Legacy numeric id (kept only for unused JS interop exports).
+    uint32_t legacy_id;
     char title[128];
     char description[512];
     TaskStatus status;
     Priority priority;
     char category[64];
+    char service_name[64];
     char due_date[32];
     char assigned_to[64];
     bool selected;
 } Task;
+
+typedef struct {
+    char id[37];
+    char name[64];
+} Service;
+
+#define TXXT_MAX_TASKS 100u
+#define TXXT_TASK_TITLE_MAX 128u
+#define TXXT_TASK_DESC_MAX 512u
+#define TXXT_TASK_CATEGORY_MAX 64u
+#define TXXT_TASK_DUE_DATE_MAX 32u
+#define TXXT_TASK_ASSIGNED_TO_MAX 64u
+
+#define TXXT_TASK_INPUT_HDR_SIZE 16u
+#define TXXT_TASK_ID_MAX 37u
+// Task input entry layout (bytes):
+// 0..3   u32 reserved
+// 4..7   u32 status
+// 8..11  u32 priority
+// 12..48 char id[37]
+// 49..51 padding
+// 52..179 title[128]
+// 180..691 description[512]
+// 692..755 category[64]
+// 756..819 service_name[64]
+// 820..851 due_date[32]
+// 852..915 assigned_to[64]
+#define TXXT_TASK_INPUT_STRIDE 916u
+#define TXXT_TASK_SERVICE_NAME_MAX 64u
+
+#define TXXT_SERVICE_INPUT_HDR_SIZE 16u
+#define TXXT_SERVICE_INPUT_STRIDE 128u
+#define TXXT_SERVICE_ID_MAX 37u
+#define TXXT_SERVICE_NAME_MAX 64u
+
+static uint8_t task_input_buffer[TXXT_TASK_INPUT_HDR_SIZE + (TXXT_MAX_TASKS * TXXT_TASK_INPUT_STRIDE)] = {0};
+static uint8_t service_input_buffer[TXXT_SERVICE_INPUT_HDR_SIZE + (64u * TXXT_SERVICE_INPUT_STRIDE)] = {0};
 
 // Filter enum
 typedef enum {
@@ -89,10 +130,15 @@ typedef enum {
 typedef struct {
     Task tasks[100];
     uint32_t task_count;
+    Service services[64];
+    uint32_t service_count;
     char current_user[64];
     int32_t selected_task_index;
+    int32_t selected_service_index;
+    int32_t pending_create_service_index;
     FilterStatus filter_status;
     bool show_create_modal;
+    bool create_panel_visible;
     bool show_detail_panel;
     bool logged_in;
 } AppState;
@@ -110,6 +156,13 @@ double window_width = 1024;
 double window_height = 768;
 
 static Rect login_rects[2] = {0};
+
+static float data_pulse_remaining = 0.0f;
+static float data_pulse_duration = 0.35f;
+
+static double app_time_seconds = 0.0;
+static int32_t last_service_click_index = -1;
+static double last_service_click_time = 0.0;
 
 // Frame arena for temporary allocations
 typedef struct {
@@ -133,6 +186,10 @@ Clay_Color GetPriorityColor(Priority p) {
         default: return COLOR_PRIORITY_LOW;
     }
 }
+
+static inline uint8_t pulse_alpha(void);
+static inline bool string_equals(const char* a, const char* b);
+static int32_t find_first_task_for_service(int32_t service_index);
 
 // Helper to get status color
 Clay_Color GetStatusColor(TaskStatus s) {
@@ -165,23 +222,49 @@ void HandleClick(Clay_ElementId elementId, Clay_PointerData pointerInfo, void *u
         if (data->action_type == 0) {
             app_state.selected_task_index = data->task_index;
             app_state.show_detail_panel = true;
+            app_state.create_panel_visible = false;
         } else if (data->action_type == 1) {
             app_state.show_create_modal = true;
+            app_state.create_panel_visible = true;
+            app_state.show_detail_panel = false;
         } else if (data->action_type == 2) {
             app_state.show_detail_panel = false;
             app_state.selected_task_index = -1;
         } else if (data->action_type == 3) {
             app_state.filter_status = (FilterStatus)data->action_data;
+        } else if (data->action_type == 4) {
+            int32_t service_index = data->action_data;
+            app_state.selected_service_index = service_index;
+
+            int32_t task_index = find_first_task_for_service(service_index);
+            if (task_index >= 0) {
+                app_state.selected_task_index = task_index;
+                app_state.show_detail_panel = true;
+                app_state.create_panel_visible = false;
+            } else {
+                app_state.selected_task_index = -1;
+                app_state.show_detail_panel = false;
+            }
+
+            double dt = app_time_seconds - last_service_click_time;
+            if (last_service_click_index == service_index && dt <= 0.35) {
+                app_state.show_create_modal = true;
+                app_state.create_panel_visible = true;
+                app_state.show_detail_panel = false;
+                app_state.pending_create_service_index = service_index;
+            }
+            last_service_click_index = service_index;
+            last_service_click_time = app_time_seconds;
         }
     }
 }
 
-// Sidebar filter button
-void FilterButton(const char* label, FilterStatus filter_value, int index) {
-    bool is_active = (app_state.filter_status == filter_value);
+// Sidebar service button
+void ServiceButton(const char* label, int32_t service_index, int index) {
+    bool is_active = (app_state.selected_service_index == service_index);
     Clay_Color bg_color = is_active ? COLOR_PRIMARY : (Clay_Hovered() ? COLOR_SIDEBAR_HOVER : COLOR_SIDEBAR);
 
-    CLAY(CLAY_IDI("FilterBtn", index), {
+    CLAY(CLAY_IDI("ServiceBtn", index), {
         .layout = {
             .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(40) },
             .padding = { 16, 16, 8, 8 },
@@ -190,11 +273,35 @@ void FilterButton(const char* label, FilterStatus filter_value, int index) {
         .backgroundColor = bg_color,
         .cornerRadius = CLAY_CORNER_RADIUS(6)
     }) {
-        Clay_OnHover(HandleClick, AllocateClickData((ClickData){0, 3, filter_value}));
+        Clay_OnHover(HandleClick, AllocateClickData((ClickData){0, 4, service_index}));
         CLAY_TEXT(make_string(label), CLAY_TEXT_CONFIG({
             .fontSize = 14,
             .fontId = FONT_ID_BODY_16,
             .textColor = COLOR_TEXT_WHITE
+        }));
+    }
+}
+
+void StatusFilterButton(const char* label, FilterStatus filter_value, int index) {
+    bool is_active = (app_state.filter_status == filter_value);
+    Clay_Color bg_color = is_active ? COLOR_PRIMARY : (Clay_Hovered() ? COLOR_PRIMARY_HOVER : COLOR_WHITE);
+    Clay_Color text_color = is_active ? COLOR_TEXT_WHITE : COLOR_TEXT;
+
+    CLAY(CLAY_IDI("StatusBtn", index), {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(28) },
+            .padding = { 10, 10, 4, 4 },
+            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+        },
+        .backgroundColor = bg_color,
+        .cornerRadius = CLAY_CORNER_RADIUS(6),
+        .border = { .width = { is_active ? 0 : 1, is_active ? 0 : 1, is_active ? 0 : 1, is_active ? 0 : 1 }, .color = COLOR_BORDER }
+    }) {
+        Clay_OnHover(HandleClick, AllocateClickData((ClickData){0, 3, filter_value}));
+        CLAY_TEXT(make_string(label), CLAY_TEXT_CONFIG({
+            .fontSize = 12,
+            .fontId = FONT_ID_BODY_16,
+            .textColor = text_color
         }));
     }
 }
@@ -235,8 +342,8 @@ void Sidebar(void) {
             .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(16) } }
         }) {}
 
-        // Filter label
-        CLAY_TEXT(CLAY_STRING("Status Filter"), CLAY_TEXT_CONFIG({
+        // Services label
+        CLAY_TEXT(CLAY_STRING("Services"), CLAY_TEXT_CONFIG({
             .fontSize = 12,
             .fontId = FONT_ID_BODY_16,
             .textColor = (Clay_Color){150, 150, 160, 255}
@@ -247,11 +354,19 @@ void Sidebar(void) {
             .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(8) } }
         }) {}
 
-        // Filter buttons
-        FilterButton("All Tasks", FILTER_ALL, 0);
-        FilterButton("Pending", FILTER_PENDING, 1);
-        FilterButton("In Progress", FILTER_IN_PROGRESS, 2);
-        FilterButton("Completed", FILTER_COMPLETED, 3);
+        // Service buttons
+        ServiceButton("All Services", -1, 0);
+        if (app_state.service_count == 0) {
+            CLAY_TEXT(CLAY_STRING("No services loaded"), CLAY_TEXT_CONFIG({
+                .fontSize = 12,
+                .fontId = FONT_ID_BODY_16,
+                .textColor = (Clay_Color){170, 170, 180, 255}
+            }));
+        } else {
+            for (uint32_t i = 0; i < app_state.service_count; i++) {
+                ServiceButton(app_state.services[i].name, (int32_t)i, (int)(i + 1));
+            }
+        }
 
         // Grow spacer
         CLAY(CLAY_ID("SidebarGrowSpacer"), {
@@ -404,6 +519,27 @@ void TaskList(void) {
                 .textColor = COLOR_TEXT
             }));
 
+            const char* service_label = "All Services";
+            if (app_state.selected_service_index >= 0 && app_state.selected_service_index < (int32_t)app_state.service_count) {
+                service_label = app_state.services[app_state.selected_service_index].name;
+            }
+
+            CLAY(CLAY_ID("TaskListServiceTag"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(28) },
+                    .padding = { 10, 10, 4, 4 },
+                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+                },
+                .backgroundColor = (Clay_Color){235, 235, 242, 255},
+                .cornerRadius = CLAY_CORNER_RADIUS(6)
+            }) {
+                CLAY_TEXT(make_string(service_label), CLAY_TEXT_CONFIG({
+                    .fontSize = 12,
+                    .fontId = FONT_ID_BODY_16,
+                    .textColor = COLOR_TEXT
+                }));
+            }
+
             // Spacer
             CLAY(CLAY_ID("HeaderSpacer"), {
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } }
@@ -429,7 +565,29 @@ void TaskList(void) {
             }
         }
 
+        // Status filters
+        CLAY(CLAY_ID("StatusFilters"), {
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                .childGap = 8,
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+            }
+        }) {
+            StatusFilterButton("All", FILTER_ALL, 0);
+            StatusFilterButton("Pending", FILTER_PENDING, 1);
+            StatusFilterButton("In Progress", FILTER_IN_PROGRESS, 2);
+            StatusFilterButton("Completed", FILTER_COMPLETED, 3);
+        }
+
         // Task count info
+        if (data_pulse_remaining > 0.0f) {
+            CLAY(CLAY_ID("TaskListPulse"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(4) } },
+                .backgroundColor = (Clay_Color){59, 130, 246, pulse_alpha()},
+                .cornerRadius = CLAY_CORNER_RADIUS(3)
+            }) {}
+        }
+
         CLAY_TEXT(CLAY_STRING("Click a task to view details"), CLAY_TEXT_CONFIG({
             .fontSize = 14,
             .fontId = FONT_ID_BODY_16,
@@ -458,6 +616,12 @@ void TaskList(void) {
                     case FILTER_COMPLETED: show = (task->status == STATUS_COMPLETED); break;
                 }
 
+                if (show && app_state.selected_service_index >= 0 &&
+                    app_state.selected_service_index < (int32_t)app_state.service_count) {
+                    const char* selected_name = app_state.services[app_state.selected_service_index].name;
+                    show = string_equals(task->service_name, selected_name);
+                }
+
                 if (show) {
                     TaskCard(task, i);
                     shown++;
@@ -483,209 +647,236 @@ void TaskList(void) {
     }
 }
 
-// Detail panel
-void DetailPanel(void) {
-    if (!app_state.show_detail_panel || app_state.selected_task_index < 0 ||
-        app_state.selected_task_index >= (int32_t)app_state.task_count) {
+// Docked panel (details or create)
+void DockPanel(float height) {
+    bool show_create = app_state.create_panel_visible;
+    bool show_detail = app_state.show_detail_panel && app_state.selected_task_index >= 0 &&
+        app_state.selected_task_index < (int32_t)app_state.task_count;
+
+    if (height <= 0.0f || (!show_create && !show_detail)) {
         return;
     }
 
-    Task* task = &app_state.tasks[app_state.selected_task_index];
+    Task* task = show_detail ? &app_state.tasks[app_state.selected_task_index] : 0;
 
-    CLAY(CLAY_ID("DetailPanel"), {
+    CLAY(CLAY_ID("DockPanel"), {
         .layout = {
-            .sizing = { CLAY_SIZING_FIXED(350), CLAY_SIZING_GROW(0) },
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(height) },
             .layoutDirection = CLAY_TOP_TO_BOTTOM,
-            .padding = { 24, 24, 24, 24 },
-            .childGap = 16
+            .padding = { 20, 24, 20, 24 },
+            .childGap = 12
         },
         .backgroundColor = COLOR_WHITE,
-        .border = { .width = { .left = 1 }, .color = COLOR_BORDER }
+        .border = { .width = { 1, 0, 0, 0 }, .color = COLOR_BORDER }
     }) {
         // Header
-        CLAY(CLAY_ID("DetailHeader"), {
+        CLAY(CLAY_ID("DockHeader"), {
             .layout = {
                 .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
                 .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
             }
         }) {
-            CLAY_TEXT(CLAY_STRING("Task Details"), CLAY_TEXT_CONFIG({
-                .fontSize = 20,
+            CLAY_TEXT(make_string(show_create ? "Create Task" : "Task Details"), CLAY_TEXT_CONFIG({
+                .fontSize = 18,
                 .fontId = FONT_ID_TITLE_24,
                 .textColor = COLOR_TEXT
             }));
 
-            CLAY(CLAY_ID("DetailHeaderSpacer"), {
+            CLAY(CLAY_ID("DockHeaderSpacer"), {
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } }
             }) {}
 
-            // Close button
-            CLAY(CLAY_ID("CloseBtn"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_FIXED(32), CLAY_SIZING_FIXED(32) },
-                    .childAlignment = { CLAY_ALIGN_X_CENTER, CLAY_ALIGN_Y_CENTER }
-                },
-                .backgroundColor = Clay_Hovered() ? (Clay_Color){240, 240, 245, 255} : COLOR_WHITE,
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                Clay_OnHover(HandleClick, AllocateClickData((ClickData){0, 2, 0}));
-                CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({
-                    .fontSize = 16,
-                    .fontId = FONT_ID_BODY_16,
-                    .textColor = COLOR_TEXT_LIGHT
-                }));
-            }
-        }
-
-        // Divider
-        CLAY(CLAY_ID("DetailDivider"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } },
-            .backgroundColor = COLOR_BORDER
-        }) {}
-
-        // Title
-        CLAY(CLAY_ID("DetailTitle"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
-                .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                .childGap = 4
-            }
-        }) {
-            CLAY_TEXT(CLAY_STRING("Title"), CLAY_TEXT_CONFIG({
-                .fontSize = 12,
-                .fontId = FONT_ID_BODY_16,
-                .textColor = COLOR_TEXT_LIGHT
-            }));
-            CLAY_TEXT(make_string(task->title), CLAY_TEXT_CONFIG({
-                .fontSize = 18,
-                .fontId = FONT_ID_BODY_20,
-                .textColor = COLOR_TEXT
-            }));
-        }
-
-        // Description
-        CLAY(CLAY_ID("DetailDesc"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
-                .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                .childGap = 4
-            }
-        }) {
-            CLAY_TEXT(CLAY_STRING("Description"), CLAY_TEXT_CONFIG({
-                .fontSize = 12,
-                .fontId = FONT_ID_BODY_16,
-                .textColor = COLOR_TEXT_LIGHT
-            }));
-            CLAY_TEXT(make_string(task->description[0] ? task->description : "No description"), CLAY_TEXT_CONFIG({
-                .fontSize = 14,
-                .fontId = FONT_ID_BODY_16,
-                .textColor = COLOR_TEXT
-            }));
-        }
-
-        // Status
-        CLAY(CLAY_ID("DetailStatus"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
-                .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                .childGap = 4
-            }
-        }) {
-            CLAY_TEXT(CLAY_STRING("Status"), CLAY_TEXT_CONFIG({
-                .fontSize = 12,
-                .fontId = FONT_ID_BODY_16,
-                .textColor = COLOR_TEXT_LIGHT
-            }));
-            CLAY(CLAY_ID("DetailStatusBadge"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
-                    .padding = { 10, 10, 6, 6 }
-                },
-                .backgroundColor = GetStatusColor(task->status),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                CLAY_TEXT(make_string(STATUS_STRINGS[task->status]), CLAY_TEXT_CONFIG({
-                    .fontSize = 14,
-                    .fontId = FONT_ID_BODY_16,
-                    .textColor = COLOR_TEXT_WHITE
-                }));
-            }
-        }
-
-        // Priority
-        CLAY(CLAY_ID("DetailPriority"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
-                .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                .childGap = 4
-            }
-        }) {
-            CLAY_TEXT(CLAY_STRING("Priority"), CLAY_TEXT_CONFIG({
-                .fontSize = 12,
-                .fontId = FONT_ID_BODY_16,
-                .textColor = COLOR_TEXT_LIGHT
-            }));
-            CLAY(CLAY_ID("DetailPriorityRow"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
-                    .childGap = 8,
-                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+            if (!show_create) {
+                CLAY(CLAY_ID("DockCloseBtn"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) },
+                        .childAlignment = { CLAY_ALIGN_X_CENTER, CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = Clay_Hovered() ? (Clay_Color){240, 240, 245, 255} : COLOR_WHITE,
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    Clay_OnHover(HandleClick, AllocateClickData((ClickData){0, 2, 0}));
+                    CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({
+                        .fontSize = 14,
+                        .fontId = FONT_ID_BODY_16,
+                        .textColor = COLOR_TEXT_LIGHT
+                    }));
                 }
-            }) {
-                CLAY(CLAY_ID("DetailPriorityDot"), {
-                    .layout = { .sizing = { CLAY_SIZING_FIXED(10), CLAY_SIZING_FIXED(10) } },
-                    .backgroundColor = GetPriorityColor(task->priority),
-                    .cornerRadius = CLAY_CORNER_RADIUS(5)
-                }) {}
-                CLAY_TEXT(make_string(PRIORITY_STRINGS[task->priority]), CLAY_TEXT_CONFIG({
-                    .fontSize = 14,
-                    .fontId = FONT_ID_BODY_16,
-                    .textColor = COLOR_TEXT
-                }));
             }
         }
 
-        // Due date
-        if (task->due_date[0] != '\0') {
-            CLAY(CLAY_ID("DetailDue"), {
+        if (show_create) {
+            CLAY_TEXT(CLAY_STRING("Fill in the form below. This panel stays docked so you can keep referencing the list."), CLAY_TEXT_CONFIG({
+                .fontSize = 13,
+                .fontId = FONT_ID_BODY_16,
+                .textColor = COLOR_TEXT_LIGHT
+            }));
+        }
+
+        if (show_detail && task) {
+            // Title
+            CLAY(CLAY_ID("DockTitle"), {
                 .layout = {
                     .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
                     .layoutDirection = CLAY_TOP_TO_BOTTOM,
                     .childGap = 4
                 }
             }) {
-                CLAY_TEXT(CLAY_STRING("Due Date"), CLAY_TEXT_CONFIG({
+                CLAY_TEXT(CLAY_STRING("Title"), CLAY_TEXT_CONFIG({
                     .fontSize = 12,
                     .fontId = FONT_ID_BODY_16,
                     .textColor = COLOR_TEXT_LIGHT
                 }));
-                CLAY_TEXT(make_string(task->due_date), CLAY_TEXT_CONFIG({
-                    .fontSize = 14,
-                    .fontId = FONT_ID_BODY_16,
+                CLAY_TEXT(make_string(task->title), CLAY_TEXT_CONFIG({
+                    .fontSize = 18,
+                    .fontId = FONT_ID_BODY_20,
                     .textColor = COLOR_TEXT
                 }));
             }
-        }
 
-        // Assigned to
-        if (task->assigned_to[0] != '\0') {
-            CLAY(CLAY_ID("DetailAssigned"), {
+            // Description
+            CLAY(CLAY_ID("DockDesc"), {
                 .layout = {
                     .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
                     .layoutDirection = CLAY_TOP_TO_BOTTOM,
                     .childGap = 4
                 }
             }) {
-                CLAY_TEXT(CLAY_STRING("Assigned To"), CLAY_TEXT_CONFIG({
+                CLAY_TEXT(CLAY_STRING("Description"), CLAY_TEXT_CONFIG({
                     .fontSize = 12,
                     .fontId = FONT_ID_BODY_16,
                     .textColor = COLOR_TEXT_LIGHT
                 }));
-                CLAY_TEXT(make_string(task->assigned_to), CLAY_TEXT_CONFIG({
+                CLAY_TEXT(make_string(task->description[0] ? task->description : "No description"), CLAY_TEXT_CONFIG({
                     .fontSize = 14,
                     .fontId = FONT_ID_BODY_16,
                     .textColor = COLOR_TEXT
                 }));
+            }
+
+            // Status
+            CLAY(CLAY_ID("DockStatus"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                    .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                    .childGap = 4
+                }
+            }) {
+                CLAY_TEXT(CLAY_STRING("Status"), CLAY_TEXT_CONFIG({
+                    .fontSize = 12,
+                    .fontId = FONT_ID_BODY_16,
+                    .textColor = COLOR_TEXT_LIGHT
+                }));
+                CLAY(CLAY_ID("DockStatusBadge"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                        .padding = { 10, 10, 6, 6 }
+                    },
+                    .backgroundColor = GetStatusColor(task->status),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(make_string(STATUS_STRINGS[task->status]), CLAY_TEXT_CONFIG({
+                        .fontSize = 14,
+                        .fontId = FONT_ID_BODY_16,
+                        .textColor = COLOR_TEXT_WHITE
+                    }));
+                }
+            }
+
+            // Priority
+            CLAY(CLAY_ID("DockPriority"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                    .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                    .childGap = 4
+                }
+            }) {
+                CLAY_TEXT(CLAY_STRING("Priority"), CLAY_TEXT_CONFIG({
+                    .fontSize = 12,
+                    .fontId = FONT_ID_BODY_16,
+                    .textColor = COLOR_TEXT_LIGHT
+                }));
+                CLAY(CLAY_ID("DockPriorityRow"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                        .childGap = 8,
+                        .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+                    }
+                }) {
+                    CLAY(CLAY_ID("DockPriorityDot"), {
+                        .layout = { .sizing = { CLAY_SIZING_FIXED(10), CLAY_SIZING_FIXED(10) } },
+                        .backgroundColor = GetPriorityColor(task->priority),
+                        .cornerRadius = CLAY_CORNER_RADIUS(5)
+                    }) {}
+                    CLAY_TEXT(make_string(PRIORITY_STRINGS[task->priority]), CLAY_TEXT_CONFIG({
+                        .fontSize = 14,
+                        .fontId = FONT_ID_BODY_16,
+                        .textColor = COLOR_TEXT
+                    }));
+                }
+            }
+
+            if (task->service_name[0] != '\0') {
+                CLAY(CLAY_ID("DockService"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                        .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                        .childGap = 4
+                    }
+                }) {
+                    CLAY_TEXT(CLAY_STRING("Service"), CLAY_TEXT_CONFIG({
+                        .fontSize = 12,
+                        .fontId = FONT_ID_BODY_16,
+                        .textColor = COLOR_TEXT_LIGHT
+                    }));
+                    CLAY_TEXT(make_string(task->service_name), CLAY_TEXT_CONFIG({
+                        .fontSize = 14,
+                        .fontId = FONT_ID_BODY_16,
+                        .textColor = COLOR_TEXT
+                    }));
+                }
+            }
+
+            if (task->due_date[0] != '\0') {
+                CLAY(CLAY_ID("DockDue"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                        .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                        .childGap = 4
+                    }
+                }) {
+                    CLAY_TEXT(CLAY_STRING("Due Date"), CLAY_TEXT_CONFIG({
+                        .fontSize = 12,
+                        .fontId = FONT_ID_BODY_16,
+                        .textColor = COLOR_TEXT_LIGHT
+                    }));
+                    CLAY_TEXT(make_string(task->due_date), CLAY_TEXT_CONFIG({
+                        .fontSize = 14,
+                        .fontId = FONT_ID_BODY_16,
+                        .textColor = COLOR_TEXT
+                    }));
+                }
+            }
+
+            if (task->assigned_to[0] != '\0') {
+                CLAY(CLAY_ID("DockAssigned"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                        .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                        .childGap = 4
+                    }
+                }) {
+                    CLAY_TEXT(CLAY_STRING("Assigned To"), CLAY_TEXT_CONFIG({
+                        .fontSize = 12,
+                        .fontId = FONT_ID_BODY_16,
+                        .textColor = COLOR_TEXT_LIGHT
+                    }));
+                    CLAY_TEXT(make_string(task->assigned_to), CLAY_TEXT_CONFIG({
+                        .fontSize = 14,
+                        .fontId = FONT_ID_BODY_16,
+                        .textColor = COLOR_TEXT
+                    }));
+                }
             }
         }
     }
@@ -779,14 +970,24 @@ void LoginScreen(void) {
 
 // Main app layout
 void MainLayout(void) {
+    float dock_height = (app_state.create_panel_visible || app_state.show_detail_panel) ? (float)(window_height * 0.33f) : 0.0f;
+
     CLAY(CLAY_ID("MainContainer"), {
         .layout = {
-            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) }
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+            .layoutDirection = CLAY_LEFT_TO_RIGHT
         }
     }) {
         Sidebar();
-        TaskList();
-        DetailPanel();
+        CLAY(CLAY_ID("MainColumn"), {
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+                .layoutDirection = CLAY_TOP_TO_BOTTOM
+            }
+        }) {
+            TaskList();
+            DockPanel(dock_height);
+        }
     }
 }
 
@@ -838,9 +1039,147 @@ static void UpdateLoginRects(void) {
     }
 }
 
+static inline uint32_t read_u32_le(const uint8_t* p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static void copy_fixed_string(char* dst, uint32_t dst_cap, const uint8_t* src, uint32_t src_cap) {
+    if (!dst || dst_cap == 0) {
+        return;
+    }
+    uint32_t i = 0;
+    for (; i + 1 < dst_cap && i < src_cap; i++) {
+        uint8_t c = src[i];
+        if (c == 0) {
+            break;
+        }
+        dst[i] = (char)c;
+    }
+    dst[i] = '\0';
+}
+
+static inline bool string_equals(const char* a, const char* b) {
+    if (a == b) {
+        return true;
+    }
+    if (!a || !b) {
+        return false;
+    }
+    uint32_t i = 0;
+    while (a[i] && b[i]) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i++;
+    }
+    return a[i] == b[i];
+}
+
+static int32_t find_first_task_for_service(int32_t service_index) {
+    if (service_index < 0 || service_index >= (int32_t)app_state.service_count) {
+        return -1;
+    }
+
+    const char* name = app_state.services[service_index].name;
+    for (uint32_t i = 0; i < app_state.task_count; i++) {
+        if (string_equals(app_state.tasks[i].service_name, name)) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+static inline uint8_t pulse_alpha(void) {
+    if (data_pulse_remaining <= 0.0f || data_pulse_duration <= 0.0f) {
+        return 0;
+    }
+    float t = data_pulse_remaining / data_pulse_duration;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    float a = 30.0f + (1.0f - t) * 140.0f;
+    if (a < 0.0f) a = 0.0f;
+    if (a > 255.0f) a = 255.0f;
+    return (uint8_t)a;
+}
+
 // WASM exports
 CLAY_WASM_EXPORT("SetScratchMemory") void SetScratchMemory(void* memory) {
     frame_arena.memory = memory;
+}
+
+CLAY_WASM_EXPORT("GetTaskInputBuffer") uint32_t GetTaskInputBuffer(void) {
+    return (uint32_t)(uintptr_t)task_input_buffer;
+}
+
+CLAY_WASM_EXPORT("GetServiceInputBuffer") uint32_t GetServiceInputBuffer(void) {
+    return (uint32_t)(uintptr_t)service_input_buffer;
+}
+
+CLAY_WASM_EXPORT("ApplyTaskInputBuffer") void ApplyTaskInputBuffer(uint32_t count) {
+    uint32_t max = count;
+    if (max > TXXT_MAX_TASKS) {
+        max = TXXT_MAX_TASKS;
+    }
+
+    for (uint32_t i = 0; i < max; i++) {
+        Task* task = &app_state.tasks[i];
+        const uint8_t* entry = task_input_buffer + TXXT_TASK_INPUT_HDR_SIZE + (i * TXXT_TASK_INPUT_STRIDE);
+
+        task->legacy_id = read_u32_le(entry + 0);
+        task->status = (TaskStatus)read_u32_le(entry + 4);
+        task->priority = (Priority)read_u32_le(entry + 8);
+
+        copy_fixed_string(task->id, sizeof(task->id), entry + 12, TXXT_TASK_ID_MAX);
+        copy_fixed_string(task->title, sizeof(task->title), entry + 52, TXXT_TASK_TITLE_MAX);
+        copy_fixed_string(task->description, sizeof(task->description), entry + 180, TXXT_TASK_DESC_MAX);
+        copy_fixed_string(task->category, sizeof(task->category), entry + 692, TXXT_TASK_CATEGORY_MAX);
+        copy_fixed_string(task->service_name, sizeof(task->service_name), entry + 756, TXXT_TASK_SERVICE_NAME_MAX);
+        copy_fixed_string(task->due_date, sizeof(task->due_date), entry + 820, TXXT_TASK_DUE_DATE_MAX);
+        copy_fixed_string(task->assigned_to, sizeof(task->assigned_to), entry + 852, TXXT_TASK_ASSIGNED_TO_MAX);
+
+        task->selected = false;
+    }
+
+    app_state.task_count = max;
+    if (app_state.selected_task_index >= (int32_t)max) {
+        app_state.selected_task_index = -1;
+        app_state.show_detail_panel = false;
+    }
+}
+
+CLAY_WASM_EXPORT("ApplyServiceInputBuffer") void ApplyServiceInputBuffer(uint32_t count) {
+    uint32_t max = count;
+    if (max > 64u) {
+        max = 64u;
+    }
+
+    for (uint32_t i = 0; i < max; i++) {
+        Service* service = &app_state.services[i];
+        const uint8_t* entry = service_input_buffer + TXXT_SERVICE_INPUT_HDR_SIZE + (i * TXXT_SERVICE_INPUT_STRIDE);
+
+        copy_fixed_string(service->id, sizeof(service->id), entry + 0, TXXT_SERVICE_ID_MAX);
+        copy_fixed_string(service->name, sizeof(service->name), entry + 64, TXXT_SERVICE_NAME_MAX);
+    }
+
+    app_state.service_count = max;
+    if (app_state.selected_service_index >= (int32_t)max) {
+        app_state.selected_service_index = -1;
+    }
+}
+
+CLAY_WASM_EXPORT("GetCurrentUserBuffer") uint32_t GetCurrentUserBuffer(void) {
+    return (uint32_t)(uintptr_t)app_state.current_user;
+}
+
+CLAY_WASM_EXPORT("SetDataDirtyPulse") void SetDataDirtyPulse(float seconds) {
+    float duration = seconds > 0.0f ? seconds : 0.35f;
+    data_pulse_duration = duration;
+    if (data_pulse_remaining < duration) {
+        data_pulse_remaining = duration;
+    }
 }
 
 #define TXXT_PACKED_CMD_SIZE 64u
@@ -1010,6 +1349,14 @@ CLAY_WASM_EXPORT("UpdateDrawFrame") void UpdateDrawFrame(
     frame_arena.offset = 0;
     window_width = width;
     window_height = height;
+    app_time_seconds += delta_time;
+
+    if (data_pulse_remaining > 0.0f) {
+        data_pulse_remaining -= delta_time;
+        if (data_pulse_remaining < 0.0f) {
+            data_pulse_remaining = 0.0f;
+        }
+    }
 
     Clay_SetLayoutDimensions((Clay_Dimensions){width, height});
     Clay_SetPointerState((Clay_Vector2){mouse_x, mouse_y}, mouse_down || touch_down);
@@ -1036,7 +1383,8 @@ CLAY_WASM_EXPORT("AddTask") void AddTask(
 ) {
     if (app_state.task_count < 100) {
         Task* task = &app_state.tasks[app_state.task_count];
-        task->id = id;
+        task->legacy_id = id;
+        task->id[0] = 0;
         task->status = (TaskStatus)status;
         task->priority = (Priority)priority;
         app_state.task_count++;
@@ -1061,12 +1409,29 @@ CLAY_WASM_EXPORT("GetShowCreateModal") bool GetShowCreateModal(void) {
     return result;
 }
 
+CLAY_WASM_EXPORT("GetPendingCreateServiceIndex") int32_t GetPendingCreateServiceIndex(void) {
+    int32_t result = app_state.pending_create_service_index;
+    app_state.pending_create_service_index = -1;
+    return result;
+}
+
+CLAY_WASM_EXPORT("SetCreatePanelVisible") void SetCreatePanelVisible(bool visible) {
+    app_state.create_panel_visible = visible;
+    if (!visible) {
+        app_state.pending_create_service_index = -1;
+    }
+}
+
 CLAY_WASM_EXPORT("InitApp") void InitApp(void) {
     app_state.logged_in = false;
     app_state.task_count = 0;
+    app_state.service_count = 0;
     app_state.selected_task_index = -1;
+    app_state.selected_service_index = -1;
+    app_state.pending_create_service_index = -1;
     app_state.filter_status = FILTER_ALL;
     app_state.show_create_modal = false;
+    app_state.create_panel_visible = false;
     app_state.show_detail_panel = false;
     app_state.current_user[0] = '\0';
 }

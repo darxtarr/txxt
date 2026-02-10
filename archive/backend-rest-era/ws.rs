@@ -6,7 +6,7 @@ use axum::{
     },
     response::IntoResponse,
 };
-use futures::{sink::SinkExt, stream::StreamExt};
+use futures_util::{SinkExt, StreamExt};
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,

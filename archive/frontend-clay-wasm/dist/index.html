@@ -44,25 +44,61 @@
         }
         .modal-overlay {
             position: fixed;
-            top: 0;
-            left: 0;
+            left: 220px;
             right: 0;
             bottom: 0;
-            background: rgba(0,0,0,0.5);
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            height: 33vh;
             z-index: 1000;
         }
         .modal-overlay.hidden {
             display: none;
         }
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle at top, rgba(245,245,250,0.96), rgba(230,233,242,0.98));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1200;
+        }
+        .loading-overlay.hidden {
+            display: none;
+        }
+        .loading-panel {
+            background: rgba(255,255,255,0.92);
+            border: 1px solid #dcdce6;
+            border-radius: 12px;
+            padding: 22px 26px;
+            width: 520px;
+            max-width: 90%;
+            box-shadow: 0 10px 28px rgba(0,0,0,0.08);
+        }
+        .loading-title {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: #222;
+        }
+        .loading-tip {
+            font-size: 14px;
+            color: #444;
+            line-height: 1.4;
+        }
         .modal-content {
             background: white;
-            border-radius: 12px;
-            padding: 24px;
-            width: 480px;
-            max-width: 90%;
+            border-top-left-radius: 12px;
+            border-top-right-radius: 12px;
+            border: 1px solid #dcdce6;
+            border-bottom: none;
+            padding: 20px 24px;
+            width: 100%;
+            height: 100%;
+            overflow-y: auto;
+            box-shadow: 0 -10px 24px rgba(0,0,0,0.08);
         }
         .modal-title {
             font-size: 20px;
@@ -97,11 +133,46 @@
         .form-row .form-group {
             flex: 1;
         }
+        .service-suggestions {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: #fff;
+            border: 1px solid #dcdce6;
+            border-radius: 6px;
+            margin-top: 6px;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.08);
+            z-index: 10;
+            max-height: 220px;
+            overflow-y: auto;
+        }
+        .service-suggestions.hidden {
+            display: none;
+        }
+        .service-suggestion {
+            padding: 10px 12px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .service-suggestion:hover {
+            background: #f5f5fa;
+        }
+        .service-field {
+            position: relative;
+        }
         .modal-actions {
             display: flex;
             gap: 12px;
             justify-content: flex-end;
             margin-top: 24px;
+        }
+        @media (max-width: 900px) {
+            .modal-overlay {
+                left: 0;
+                right: 0;
+                height: 45vh;
+            }
         }
         .btn {
             padding: 10px 20px;
@@ -156,6 +227,13 @@
 <body>
     <canvas id="canvas"></canvas>
 
+    <div id="loading-overlay" class="loading-overlay hidden">
+        <div class="loading-panel">
+            <div class="loading-title">Warming up the workstation</div>
+            <div class="loading-tip" id="loading-tip"></div>
+        </div>
+    </div>
+
     <!-- Login form overlay -->
     <div id="login-overlay">
         <input type="text" id="login-username" class="input-overlay active" placeholder="Username" autocomplete="username">
@@ -196,8 +274,11 @@
                 </div>
                 <div class="form-row">
                     <div class="form-group">
-                        <label class="form-label">Category</label>
-                        <input type="text" class="form-input" id="task-category">
+                        <label class="form-label">Service</label>
+                        <div class="service-field">
+                            <input type="text" class="form-input" id="task-service" autocomplete="off" placeholder="Search services">
+                            <div id="service-suggestions" class="service-suggestions hidden"></div>
+                        </div>
                     </div>
                     <div class="form-group">
                         <label class="form-label">Due Date</label>
@@ -252,6 +333,9 @@
     let authToken = null;
     let wsConnection = null;
     let appStatePtr = null;
+    let taskInputPtr = null;
+    let serviceInputPtr = null;
+    let currentUserPtr = null;
 
     const textDecoder = new TextDecoder("utf-8");
     const textEncoder = new TextEncoder();
@@ -264,9 +348,44 @@
         'system-ui, -apple-system, sans-serif',  // FONT_ID_TITLE_32
     ];
 
+    let services = [];
+    let selectedServiceId = null;
+    let wsReloadTimer = null;
+
+    const loadingTips = [
+        'Tip: Use the status filter in the left rail to keep your day focused.',
+        'Tip: A short, clear task title makes search feel instant.',
+        'Tip: Priorities are for sequencing; categories are for grouping.',
+        'Tip: Due dates are for commitments, not wishes.',
+        'Tip: If a task is stuck, add a one-line next action.',
+        'Tip: Fast triage beats perfect triage. Capture first, refine later.',
+        'Tip: Batch similar tasks to reduce context switching.',
+        'Tip: Clear "In Progress" before starting new work. Momentum matters.',
+        'Tip: A tiny description now saves a big re-read later.',
+        'Tip: Assign a service to track who pays for the time.'
+    ];
+
     // Packed render command stream produced by WASM (do not parse Clay structs from JS).
     const PACKED_HDR_SIZE = 16;
     const PACKED_CMD_SIZE = 64;
+
+    const TASK_INPUT_HDR_SIZE = 16;
+    // Task input entry layout matches frontend/main.c (TXXT_TASK_INPUT_STRIDE).
+    const TASK_INPUT_STRIDE = 916;
+    const TASK_TITLE_MAX = 128;
+    const TASK_DESC_MAX = 512;
+    const TASK_CATEGORY_MAX = 64;
+    const TASK_SERVICE_NAME_MAX = 64;
+    const TASK_DUE_DATE_MAX = 32;
+    const TASK_ASSIGNED_TO_MAX = 64;
+    const TASK_ID_MAX = 37;
+    const TASK_INPUT_MAX = 100;
+
+    const SERVICE_INPUT_HDR_SIZE = 16;
+    const SERVICE_INPUT_STRIDE = 128;
+    const SERVICE_ID_MAX = 37;
+    const SERVICE_NAME_MAX = 64;
+    const SERVICE_INPUT_MAX = 64;
 
     function getTextDimensions(text, font) {
         window.canvasContext.font = font;
@@ -312,10 +431,15 @@
             });
             authToken = data.token;
             localStorage.setItem('auth_token', authToken);
-            writeStringToMemory(appStatePtr + getAppStateOffset('current_user'), username);
+            if (currentUserPtr) {
+                writeFixedString(currentUserPtr, username, 64);
+            }
             instance.exports.SetLoggedIn(true);
             document.getElementById('login-overlay').classList.add('hidden');
-            await loadTasks();
+            await withDailyLoadingOverlay(async () => {
+                await loadServices();
+                await loadTasks();
+            });
             connectWebSocket();
         } catch (err) {
             console.error('Login failed:', err);
@@ -323,33 +447,192 @@
         }
     }
 
+    async function loadServices() {
+        try {
+            const data = await apiRequest('/services');
+            services = (data || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+            if (serviceInputPtr) {
+                const count = Math.min(services.length, SERVICE_INPUT_MAX);
+                memoryDataView.setUint32(serviceInputPtr + 0, count, true);
+                memoryDataView.setUint32(serviceInputPtr + 4, SERVICE_INPUT_STRIDE, true);
+                memoryDataView.setUint32(serviceInputPtr + 8, 0, true);
+                memoryDataView.setUint32(serviceInputPtr + 12, 0, true);
+
+                for (let i = 0; i < count; i++) {
+                    const service = services[i];
+                    const base = serviceInputPtr + SERVICE_INPUT_HDR_SIZE + (i * SERVICE_INPUT_STRIDE);
+                    writeFixedString(base + 0, service.id || '', SERVICE_ID_MAX);
+                    writeFixedString(base + 64, service.name || '', SERVICE_NAME_MAX);
+                }
+
+                instance.exports.ApplyServiceInputBuffer(count);
+            }
+        } catch (err) {
+            console.error('Failed to load services:', err);
+            services = [];
+        }
+    }
+
+    async function withDailyLoadingOverlay(work) {
+        const today = new Date().toISOString().slice(0, 10);
+        const last = localStorage.getItem('txxt_tip_date');
+        const overlay = document.getElementById('loading-overlay');
+        const tip = document.getElementById('loading-tip');
+        const show = overlay && tip && last !== today;
+
+        if (show) {
+            const choice = loadingTips[Math.floor(Math.random() * loadingTips.length)];
+            tip.textContent = choice;
+            overlay.classList.remove('hidden');
+        }
+
+        const minMs = 900;
+        const start = performance.now();
+        try {
+            await work();
+        } finally {
+            if (show) {
+                const elapsed = performance.now() - start;
+                const wait = Math.max(0, minMs - elapsed);
+                setTimeout(() => {
+                    overlay.classList.add('hidden');
+                    localStorage.setItem('txxt_tip_date', today);
+                }, wait);
+            }
+        }
+    }
+
+    function normalizeText(value) {
+        return (value || '').toLowerCase().trim();
+    }
+
+    function scoreServiceMatch(query, name) {
+        const q = normalizeText(query);
+        const n = normalizeText(name);
+        if (!q) {
+            return 1;
+        }
+
+        let score = 0;
+        if (n.includes(q)) {
+            score += 100 + q.length * 2;
+        }
+
+        const tokens = q.split(/\s+/).filter(Boolean);
+        for (const token of tokens) {
+            if (n.includes(token)) {
+                score += 10;
+            }
+        }
+
+        let qi = 0;
+        let gaps = 0;
+        for (let i = 0; i < n.length && qi < q.length; i++) {
+            if (n[i] === q[qi]) {
+                qi++;
+            } else if (qi > 0) {
+                gaps++;
+            }
+        }
+        if (qi === q.length) {
+            score += 20 + Math.max(0, q.length * 2 - gaps);
+        }
+
+        return score;
+    }
+
+    function renderServiceSuggestions(query) {
+        const list = document.getElementById('service-suggestions');
+        if (!list) return;
+
+        const matches = services
+            .map((service) => ({ service, score: scoreServiceMatch(query, service.name) }))
+            .filter((entry) => entry.score > 0 || !normalizeText(query))
+            .sort((a, b) => {
+                if (b.score !== a.score) return b.score - a.score;
+                return a.service.name.localeCompare(b.service.name);
+            })
+            .slice(0, 6);
+
+        list.innerHTML = '';
+
+        if (!matches.length) {
+            list.classList.add('hidden');
+            return;
+        }
+
+        for (const entry of matches) {
+            const item = document.createElement('div');
+            item.className = 'service-suggestion';
+            item.textContent = entry.service.name;
+            item.dataset.serviceId = entry.service.id;
+            item.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                selectService(entry.service);
+            });
+            list.appendChild(item);
+        }
+
+        list.classList.remove('hidden');
+    }
+
+    function selectService(service) {
+        const input = document.getElementById('task-service');
+        const list = document.getElementById('service-suggestions');
+        if (input) {
+            input.value = service.name;
+        }
+        selectedServiceId = service.id;
+        if (list) {
+            list.classList.add('hidden');
+        }
+    }
+
+    function settleServiceSelection() {
+        const input = document.getElementById('task-service');
+        if (!input) return;
+
+        const value = normalizeText(input.value);
+        const exact = services.find((service) => normalizeText(service.name) === value);
+        if (exact) {
+            selectedServiceId = exact.id;
+            return;
+        }
+        selectedServiceId = null;
+    }
+
     async function loadTasks() {
         try {
             const tasks = await apiRequest('/tasks');
-            instance.exports.ClearTasks();
+            const statusMap = { 'Pending': 0, 'InProgress': 1, 'Completed': 2 };
+            const priorityMap = { 'Low': 0, 'Medium': 1, 'High': 2, 'Urgent': 3 };
+            const count = Math.min(tasks.length, TASK_INPUT_MAX);
+            const serviceById = new Map(services.map((service) => [service.id, service.name]));
 
-            for (const task of tasks) {
-                const statusMap = { 'Pending': 0, 'InProgress': 1, 'Completed': 2 };
-                const priorityMap = { 'Low': 0, 'Medium': 1, 'High': 2, 'Urgent': 3 };
+            memoryDataView.setUint32(taskInputPtr + 0, count, true);
+            memoryDataView.setUint32(taskInputPtr + 4, TASK_INPUT_STRIDE, true);
+            memoryDataView.setUint32(taskInputPtr + 8, 0, true);
+            memoryDataView.setUint32(taskInputPtr + 12, 0, true);
 
-                // Add task to WASM state
-                instance.exports.AddTask(
-                    task.id || 0,
-                    statusMap[task.status] || 0,
-                    priorityMap[task.priority] || 0
-                );
+            for (let i = 0; i < count; i++) {
+                const task = tasks[i];
+                const base = taskInputPtr + TASK_INPUT_HDR_SIZE + (i * TASK_INPUT_STRIDE);
 
-                // Write strings to task memory
-                const taskCount = instance.exports.GetTaskCount();
-                const taskIndex = taskCount - 1;
-                const taskOffset = getTaskOffset(taskIndex);
+                // Reserved/legacy numeric id (not used; UUID string is authoritative).
+                memoryDataView.setUint32(base + 0, 0, true);
+                memoryDataView.setUint32(base + 4, statusMap[task.status] || 0, true);
+                memoryDataView.setUint32(base + 8, priorityMap[task.priority] || 0, true);
 
-                writeStringToMemory(taskOffset + 4, task.title || ''); // title
-                writeStringToMemory(taskOffset + 132, task.description || ''); // description
-                writeStringToMemory(taskOffset + 648, task.category || ''); // category
-                writeStringToMemory(taskOffset + 712, task.due_date ? task.due_date.split('T')[0] : ''); // due_date
-                writeStringToMemory(taskOffset + 744, task.assigned_to_name || ''); // assigned_to
+                writeFixedString(base + 12, task.id || '', TASK_ID_MAX);
+                writeFixedString(base + 52, task.title || '', TASK_TITLE_MAX);
+                writeFixedString(base + 180, task.description || '', TASK_DESC_MAX);
+                writeFixedString(base + 692, task.category || '', TASK_CATEGORY_MAX);
+                writeFixedString(base + 756, serviceById.get(task.service_id) || '', TASK_SERVICE_NAME_MAX);
+                writeFixedString(base + 820, task.due_date ? task.due_date.split('T')[0] : '', TASK_DUE_DATE_MAX);
+                writeFixedString(base + 852, task.assigned_to_name || '', TASK_ASSIGNED_TO_MAX);
             }
+
+            instance.exports.ApplyTaskInputBuffer(count);
         } catch (err) {
             console.error('Failed to load tasks:', err);
         }
@@ -411,7 +694,15 @@
             console.log('WS message:', msg);
 
             if (msg.type === 'task_created' || msg.type === 'task_updated' || msg.type === 'task_deleted') {
-                loadTasks();
+                if (instance?.exports?.SetDataDirtyPulse) {
+                    instance.exports.SetDataDirtyPulse(0.35);
+                }
+                if (!wsReloadTimer) {
+                    wsReloadTimer = setTimeout(async () => {
+                        wsReloadTimer = null;
+                        await loadTasks();
+                    }, 200);
+                }
             }
         };
 
@@ -426,34 +717,15 @@
     }
 
     // Memory helpers
-    function getAppStateOffset(field) {
-        // AppState structure offsets
-        const offsets = {
-            'tasks': 0,
-            'task_count': 81200, // 100 tasks * 812 bytes each
-            'current_user': 81204,
-            'selected_task_index': 81268,
-            'filter_status': 81272,
-            'show_create_modal': 81276,
-            'show_detail_panel': 81277,
-            'logged_in': 81278
-        };
-        return offsets[field] || 0;
-    }
-
-    function getTaskOffset(index) {
-        // Each task is ~812 bytes
-        return appStatePtr + (index * 812);
-    }
-
-    function writeStringToMemory(address, str) {
+    function writeFixedString(address, str, maxLen) {
         const bytes = textEncoder.encode(str);
-        const maxLen = 127; // Leave room for null terminator
-        const len = Math.min(bytes.length, maxLen);
+        const len = Math.min(bytes.length, Math.max(0, maxLen - 1));
+        for (let i = 0; i < maxLen; i++) {
+            memoryDataView.setUint8(address + i, 0);
+        }
         for (let i = 0; i < len; i++) {
             memoryDataView.setUint8(address + i, bytes[i]);
         }
-        memoryDataView.setUint8(address + len, 0); // Null terminator
     }
 
     function resizeCanvasIfNeeded() {
@@ -768,7 +1040,11 @@
 
         // Check if we need to show create modal
         if (instance.exports.GetShowCreateModal()) {
-            showCreateModal();
+            let serviceIndex = -1;
+            if (instance.exports.GetPendingCreateServiceIndex) {
+                serviceIndex = instance.exports.GetPendingCreateServiceIndex();
+            }
+            showCreateModal(serviceIndex);
         }
 
         // Position login inputs if on login screen
@@ -781,15 +1057,37 @@
     }
 
     // Modal functions
-    function showCreateModal() {
+    function showCreateModal(serviceIndex = -1) {
         document.getElementById('task-modal').classList.remove('hidden');
         document.getElementById('modal-title').textContent = 'Create Task';
         document.getElementById('submit-btn').textContent = 'Create';
         document.getElementById('task-form').reset();
+        selectedServiceId = null;
+        const serviceInput = document.getElementById('task-service');
+        if (serviceInput) {
+            if (serviceIndex >= 0 && serviceIndex < services.length) {
+                const service = services[serviceIndex];
+                serviceInput.value = service.name;
+                selectedServiceId = service.id;
+            } else {
+                serviceInput.value = '';
+            }
+            renderServiceSuggestions(serviceInput.value);
+        }
+        if (instance?.exports?.SetCreatePanelVisible) {
+            instance.exports.SetCreatePanelVisible(true);
+        }
     }
 
     function hideModal() {
         document.getElementById('task-modal').classList.add('hidden');
+        const list = document.getElementById('service-suggestions');
+        if (list) {
+            list.classList.add('hidden');
+        }
+        if (instance?.exports?.SetCreatePanelVisible) {
+            instance.exports.SetCreatePanelVisible(false);
+        }
     }
 
     // Initialize
@@ -877,6 +1175,26 @@
         });
 
         // Task form handling
+        const serviceInput = document.getElementById('task-service');
+        if (serviceInput) {
+            serviceInput.addEventListener('input', (e) => {
+                selectedServiceId = null;
+                renderServiceSuggestions(e.target.value);
+            });
+            serviceInput.addEventListener('focus', (e) => {
+                renderServiceSuggestions(e.target.value);
+            });
+            serviceInput.addEventListener('blur', () => {
+                settleServiceSelection();
+                setTimeout(() => {
+                    const list = document.getElementById('service-suggestions');
+                    if (list) {
+                        list.classList.add('hidden');
+                    }
+                }, 150);
+            });
+        }
+
         document.getElementById('task-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const statusMap = ['Pending', 'InProgress', 'Completed'];
@@ -887,7 +1205,8 @@
                 description: document.getElementById('task-description').value || null,
                 status: statusMap[parseInt(document.getElementById('task-status').value)],
                 priority: priorityMap[parseInt(document.getElementById('task-priority').value)],
-                category: document.getElementById('task-category').value || null,
+                category: null,
+                service_id: selectedServiceId,
                 due_date: document.getElementById('task-due-date').value || null
             };
 
@@ -953,12 +1272,18 @@
         // Initialize app
         instance.exports.InitApp();
         appStatePtr = instance.exports.GetAppState();
+        taskInputPtr = instance.exports.GetTaskInputBuffer();
+        serviceInputPtr = instance.exports.GetServiceInputBuffer();
+        currentUserPtr = instance.exports.GetCurrentUserBuffer();
 
         resizeCanvasIfNeeded();
 
         // Dev mode: skip login, go straight to tasks.
         try {
-            await loadTasks();
+            await withDailyLoadingOverlay(async () => {
+                await loadServices();
+                await loadTasks();
+            });
         } catch (_err) {
             // Ignore; backend may be down during frontend iteration.
         }

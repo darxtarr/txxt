@@ -1,4 +1,4 @@
-use crate::models::{Task, User};
+use crate::models::{Service, Task, User};
 use redb::{Database, ReadableTable, TableDefinition};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -6,6 +6,7 @@ use uuid::Uuid;
 const USERS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("users");
 const TASKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tasks");
 const USERNAME_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("username_index");
+const SERVICES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("services");
 
 #[derive(Clone)]
 pub struct Db {
@@ -22,10 +23,38 @@ impl Db {
             let _ = write_txn.open_table(USERS_TABLE)?;
             let _ = write_txn.open_table(TASKS_TABLE)?;
             let _ = write_txn.open_table(USERNAME_INDEX)?;
+            let _ = write_txn.open_table(SERVICES_TABLE)?;
         }
         write_txn.commit()?;
 
         Ok(Db { db: Arc::new(db) })
+    }
+
+    // Service operations
+    pub fn create_service(&self, service: &Service) -> Result<(), redb::Error> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut services_table = write_txn.open_table(SERVICES_TABLE)?;
+            let service_bytes = postcard::to_allocvec(service).unwrap();
+            let id_bytes = service.id.as_bytes();
+            services_table.insert(id_bytes.as_slice(), service_bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn list_services(&self) -> Result<Vec<Service>, redb::Error> {
+        let read_txn = self.db.begin_read()?;
+        let services_table = read_txn.open_table(SERVICES_TABLE)?;
+
+        let mut services = Vec::new();
+        for entry in services_table.iter()? {
+            let (_, value) = entry?;
+            let service: Service = postcard::from_bytes(value.value()).unwrap();
+            services.push(service);
+        }
+        services.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(services)
     }
 
     // User operations
@@ -35,7 +64,7 @@ impl Db {
             let mut users_table = write_txn.open_table(USERS_TABLE)?;
             let mut username_index = write_txn.open_table(USERNAME_INDEX)?;
 
-            let user_bytes = serde_json::to_vec(user).unwrap();
+            let user_bytes = postcard::to_allocvec(user).unwrap();
             let id_bytes = user.id.as_bytes();
 
             users_table.insert(id_bytes.as_slice(), user_bytes.as_slice())?;
@@ -52,7 +81,7 @@ impl Db {
         let id_bytes = id.as_bytes();
         match users_table.get(id_bytes.as_slice())? {
             Some(data) => {
-                let user: User = serde_json::from_slice(data.value()).unwrap();
+                let user: User = postcard::from_bytes(data.value()).unwrap();
                 Ok(Some(user))
             }
             None => Ok(None),
@@ -68,7 +97,7 @@ impl Db {
                 let users_table = read_txn.open_table(USERS_TABLE)?;
                 match users_table.get(id_data.value())? {
                     Some(user_data) => {
-                        let user: User = serde_json::from_slice(user_data.value()).unwrap();
+                        let user: User = postcard::from_bytes(user_data.value()).unwrap();
                         Ok(Some(user))
                     }
                     None => Ok(None),
@@ -85,7 +114,7 @@ impl Db {
         let mut users = Vec::new();
         for entry in users_table.iter()? {
             let (_, value) = entry?;
-            let user: User = serde_json::from_slice(value.value()).unwrap();
+            let user: User = postcard::from_bytes(value.value()).unwrap();
             users.push(user);
         }
         Ok(users)
@@ -96,7 +125,7 @@ impl Db {
         let write_txn = self.db.begin_write()?;
         {
             let mut tasks_table = write_txn.open_table(TASKS_TABLE)?;
-            let task_bytes = serde_json::to_vec(task).unwrap();
+            let task_bytes = postcard::to_allocvec(task).unwrap();
             let id_bytes = task.id.as_bytes();
             tasks_table.insert(id_bytes.as_slice(), task_bytes.as_slice())?;
         }
@@ -111,7 +140,7 @@ impl Db {
         let id_bytes = id.as_bytes();
         match tasks_table.get(id_bytes.as_slice())? {
             Some(data) => {
-                let task: Task = serde_json::from_slice(data.value()).unwrap();
+                let task: Task = postcard::from_bytes(data.value()).unwrap();
                 Ok(Some(task))
             }
             None => Ok(None),
@@ -125,7 +154,7 @@ impl Db {
         let mut tasks = Vec::new();
         for entry in tasks_table.iter()? {
             let (_, value) = entry?;
-            let task: Task = serde_json::from_slice(value.value()).unwrap();
+            let task: Task = postcard::from_bytes(value.value()).unwrap();
             tasks.push(task);
         }
 
@@ -138,7 +167,7 @@ impl Db {
         let write_txn = self.db.begin_write()?;
         {
             let mut tasks_table = write_txn.open_table(TASKS_TABLE)?;
-            let task_bytes = serde_json::to_vec(task).unwrap();
+            let task_bytes = postcard::to_allocvec(task).unwrap();
             let id_bytes = task.id.as_bytes();
             tasks_table.insert(id_bytes.as_slice(), task_bytes.as_slice())?;
         }
@@ -186,6 +215,38 @@ impl Db {
             self.create_user(&admin_user)?;
             println!("Created default admin user (username: admin, password: admin)");
         }
+        Ok(())
+    }
+
+    pub fn ensure_default_services(&self) -> Result<(), redb::Error> {
+        let services = self.list_services()?;
+        if !services.is_empty() {
+            return Ok(());
+        }
+
+        let defaults = [
+            ("6b3c18d4-2a1d-4f2b-9d4c-0a0c3f0f2f10", "Billing Portal"),
+            ("a8c2f1f0-8b8f-4a62-9d3a-8c1d7b4c2a01", "Customer Support"),
+            ("2e6a7c11-8c39-4d5f-9a0e-6e1a4c7f3b22", "Data Warehouse"),
+            ("d0b74f7e-3c2a-4a58-8b21-5e9d2a1c4f33", "Fraud Detection"),
+            ("f2a1c3b4-5d6e-4f70-8123-4567890abcde", "Identity"),
+            ("0c1d2e3f-4a5b-6c7d-8e9f-0123456789ab", "Internal Tools"),
+            ("11121314-1516-1718-191a-1b1c1d1e1f20", "Mobile App"),
+            ("21222324-2526-2728-292a-2b2c2d2e2f30", "Payments"),
+            ("31323334-3536-3738-393a-3b3c3d3e3f40", "Reporting"),
+            ("41424344-4546-4748-494a-4b4c4d4e4f50", "Search"),
+            ("51525354-5556-5758-595a-5b5c5d5e5f60", "Shipping"),
+            ("61626364-6566-6768-696a-6b6c6d6e6f70", "Web App"),
+        ];
+
+        for (id, name) in defaults {
+            let service = Service {
+                id: Uuid::parse_str(id).unwrap(),
+                name: name.to_string(),
+            };
+            self.create_service(&service)?;
+        }
+
         Ok(())
     }
 }

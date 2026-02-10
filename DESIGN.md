@@ -1,0 +1,282 @@
+# txxt — Design Document
+
+Updated 2026-02-10. This is the source of truth for architectural decisions.
+
+## What this is
+
+A Small Multiplayer Online (SMO) scheduling portal for 5-20 ops users on
+enterprise CloudPCs (software-rendered VDI, no GPU). Not a web app. Not
+Google Calendar + Tasks. Think game server + thin client renderer.
+
+The goal: stop wasting time filling in Sharepoint text fields. Make scheduling
+and time tracking feel like a Bloomberg terminal — always-on, stateful,
+information-dense, built for people who use it 8 hours a day.
+
+## Mental model: game server, not web API
+
+This is NOT a REST API with a database and a frontend that makes fetch calls.
+This IS a stateful server that:
+
+- Boots, loads the world into memory
+- Accepts player connections (WebSocket)
+- Receives inputs (commands), validates and applies them to the world state
+- Broadcasts state deltas to all connected players
+- Persists the world to disk (redb) as a save file, not a query engine
+
+The browser is a thin renderer. It sends inputs, receives state, draws pixels.
+It does not own state. It does not make decisions. It does not have a "model
+layer." IRONCLAD is the GPU; the Rust server is the CPU.
+
+## Two repos, one product
+
+### txxt2 (IRONCLAD) — the renderer
+
+Canvas/DOM hybrid. Validated on CloudPC at 32fps (VDI ceiling) with 5000
+entities. Zero dependencies, zero build step.
+
+- Canvas layer: static grid, passive entity rendering, DPR-aware
+- DOM pool: 15 recycled divs, "flashlight" hydrated near cursor (SDF)
+- SoA typed arrays, spatial bucketing, frame-stamp dedup
+- Drag-and-drop with 15-minute grid snap
+- Currently generates random test data — no server connection yet
+
+### txxt (this repo) — the game server
+
+Rust/axum single binary. Authoritative state machine. Owns the world.
+
+## Architecture
+
+```
+Enterprise systems (ServiceNow, etc.)
+         | Nightly ETL (future)
+         v
+   txxt server (Rust, single binary)
+     - In-memory world state (the runtime truth)
+     - redb (save file, loaded on boot, flushed on mutation)
+     - WebSocket: THE data protocol (binary frames)
+     - REST: auth only (login, maybe health)
+         |
+         | Binary frames (packed structs, DataView on client)
+         v
+   IRONCLAD (browser)
+     - Sends: player commands (move_task, create_task, etc.)
+     - Receives: snapshots + deltas
+     - Renders: Canvas + DOM pool
+     - Owns NOTHING except pixels and input events
+```
+
+## Server internals — pseudo-ECS
+
+The server thinks in entities and components, not ORM objects.
+
+### World state (in-memory, authoritative)
+
+```rust
+struct World {
+    // Entity storage — HashMap for now, SoA later if needed
+    tasks: HashMap<Uuid, Task>,
+    users: HashMap<Uuid, User>,
+    services: HashMap<Uuid, Service>,
+
+    // Monotonic revision counter — every mutation increments this
+    revision: u64,
+
+    // Connected players
+    connections: HashMap<ConnectionId, PlayerSession>,
+}
+
+struct PlayerSession {
+    user_id: Uuid,
+    last_seen_rev: u64,
+    // What view they're looking at (which week, which service filter)
+    // So we can send targeted deltas later if needed
+}
+```
+
+### Boot sequence
+
+1. Open redb, load all entities into World
+2. Bind port, start accepting connections
+3. Ready (no cold queries ever — everything served from memory)
+
+### Mutation flow (the hot path)
+
+```
+Client sends binary command over WS
+  → Server deserializes command
+  → Server validates against World state
+    (conflict detection, permission checks, business rules)
+  → Server applies mutation to World (memory)
+  → Server increments revision
+  → Server flushes mutation to redb (async or sync — TBD)
+  → Server packs binary delta
+  → Server broadcasts delta to all connected clients
+```
+
+One codepath. One protocol. One serialization format.
+
+### Persistence
+
+redb is a save file. The server does NOT query redb at runtime.
+
+- Boot: load everything from redb into World
+- Mutation: write-through to redb after applying to memory
+- Crash recovery: reboot, reload from redb (ACID guarantees)
+- redb transactions are cheap for single writes at this scale
+
+## Protocol — WebSocket only for data
+
+### Client → Server (commands)
+
+```
+MoveTask     { task_id, day, start_time, duration }
+CreateTask   { title, service_id, ... }
+UpdateTask   { task_id, fields... }
+DeleteTask   { task_id }
+Subscribe    { view: WeekView | DayView, week_start }
+```
+
+### Server → Client (events)
+
+```
+Snapshot     { revision, tasks[], services[], users[] }
+TaskMoved    { revision, task_id, day, start_time, duration }
+TaskCreated  { revision, task }
+TaskUpdated  { revision, task_id, fields... }
+TaskDeleted  { revision, task_id }
+```
+
+All binary. Packed structs. Readable by JS DataView at known offsets.
+
+### Sync semantics
+
+- Every event carries a revision number
+- Client tracks last_seen_rev
+- On reconnect: client sends last_seen_rev, server sends deltas since then
+  (or full snapshot if gap is too large)
+- Server arbitrates conflicts (last write wins for now, smarter later)
+
+## Data model — minimal until real data arrives
+
+The model stays thin until we connect to real enterprise data sources
+(ServiceNow, custom APIs). Only what IRONCLAD needs to render:
+
+### Task (the unit of work)
+
+Core identity:
+- id, title, service_id, created_by
+
+Scheduling (what IRONCLAD renders on the grid):
+- day (0-6, Mon-Sun)
+- start_time (minutes from midnight, snapped to 15-min grid)
+- duration (minutes, snapped to 15-min grid)
+- assigned_to (who owns this time slot)
+
+State:
+- status: Staged | Scheduled | Active | Completed
+  (Staged = no time slot. Scheduled = has a slot. Active = being worked now.)
+- priority: Low | Medium | High | Urgent (drives staging auto-sort)
+
+### Service (who pays for the time)
+
+- id, name
+- Metadata TBD when real data sources arrive
+
+### User (a player)
+
+- id, username, password_hash
+
+Everything else (category, tags, description, due_date) is deferred until
+real data tells us what it should be.
+
+## Key decisions
+
+### No JSON in the data path
+
+- **Storage**: postcard (binary, serde-compatible). Interim until rkyv
+  (zero-copy) when we optimize the in-memory serve layer.
+- **Wire (WebSocket)**: hand-rolled packed binary. DataView on client.
+- **REST (auth only)**: JSON is fine. Called once per session.
+
+### redb stays
+
+Pure Rust, single-file, ACID. Treated as a save file, not a query engine.
+Loaded on boot, flushed on mutation.
+
+### IRONCLAD is the renderer, period
+
+The server decides what exists and where. IRONCLAD draws it.
+
+### Security is deferred
+
+Dev-mode auth bypass active. Hardcoded JWT secret. Do not deploy publicly.
+Hardening is a future phase after the system works.
+
+## Current backend state (updated 2026-02-10)
+
+The game server architecture is implemented. The old webdev-CRUD layer has
+been removed. What exists now:
+
+### Modules
+
+- **world.rs** — Pure state machine. `World` struct with HashMap entity
+  storage, `Command`/`Event` enums, `apply()` mutation codepath, revision
+  counter, event log, staging queue. Zero IO, fully unit-tested (17 tests).
+
+- **persist.rs** — `SaveFile` wrapper around redb. `load_world()` on boot,
+  `flush()` on every mutation (sync write-through). Seeding helpers for
+  default services/user. Tested with real redb files (4 tests).
+
+- **game.rs** — WebSocket handler at `/api/game`. On connect: subscribes to
+  broadcast, sends binary Snapshot, then enters command/event loop. Uses
+  postcard for wire serialization (interim — fixed-stride DataView planned).
+
+- **auth.rs** — Login handler at `POST /api/auth/login`. Reads users from
+  World (not from a separate database). JWT tokens. Dev-mode auth bypass on
+  WS (no token required yet).
+
+- **main.rs** — Boot sequence: open SaveFile → load World → seed defaults →
+  create broadcast channel → start axum. ~90 lines.
+
+### Removed
+- `api.rs` — REST CRUD endpoints (replaced by WS commands)
+- `ws.rs` — JSON WebSocket handler (replaced by binary game.rs)
+- `db.rs` — Old database layer (replaced by persist.rs + World)
+- `models.rs` — Old model types (replaced by world.rs types)
+
+### Test coverage
+21 unit tests covering: task lifecycle (create/schedule/move/unschedule/
+complete/delete), validation (day/time/duration bounds, status transitions),
+revision counter, event log, staging queue sorting, redb round-trips.
+
+## Dependencies — audit pending
+
+Current (11 direct deps, ~284 transitive):
+axum, tokio, redb, serde, serde_json, postcard, uuid, argon2, jsonwebtoken,
+tower-http, chrono, futures-util.
+
+Cleaned 2026-02-10: removed `rand`, `tower 0.4`, `futures` (dead weight).
+
+**Needs a deep analysis session:**
+- **jsonwebtoken** — heaviest dep (ring C/ASM crypto). Replace with session
+  tokens in redb, or HMAC-SHA256.
+- **tower-http** — ServeDir + CORS. Hand-rollable but tedious.
+- **chrono** — swap to `time` crate or timestamps-as-i64 when model finalizes.
+- **postcard** — interim. rkyv is the target for zero-copy.
+
+## What's archived
+
+`archive/` contains the Clay/WASM era: dead frontend, old handover docs,
+screenshots, scratch files. Kept for reference.
+
+## Philosophy
+
+- This is a game server, not a web API.
+- The server owns the world. Clients are renderers.
+- No blocking UI. Docked panels, not modals.
+- Performance is a feature. Zero allocations in hot paths.
+- Binary everything. JSON only at auth boundary.
+- Keyboard-first. Mouse works too.
+- Services are the primary axis ("who pays for the time").
+- Security later. Correctness and speed now.
+- No speculative features. Build what's needed, not what might be.

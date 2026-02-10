@@ -21,18 +21,20 @@ pub enum Priority {
 pub struct Task {
     pub id: Uuid,
     pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub description: Option<String>,
     pub status: TaskStatus,
     pub priority: Priority,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub category: Option<String>,
     #[serde(default)]
+    pub service_id: Option<Uuid>,
+    #[serde(default)]
     pub tags: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub due_date: Option<DateTime<Utc>>,
     pub created_by: Uuid,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub assigned_to: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -44,6 +46,12 @@ pub struct User {
     pub username: String,
     pub password_hash: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Service {
+    pub id: Uuid,
+    pub name: String,
 }
 
 // API request/response types
@@ -74,6 +82,7 @@ pub struct CreateTaskRequest {
     #[serde(default = "default_priority")]
     pub priority: Priority,
     pub category: Option<String>,
+    pub service_id: Option<Uuid>,
     #[serde(default)]
     pub tags: Vec<String>,
     pub due_date: Option<DateTime<Utc>>,
@@ -95,6 +104,7 @@ pub struct UpdateTaskRequest {
     pub status: Option<TaskStatus>,
     pub priority: Option<Priority>,
     pub category: Option<String>,
+    pub service_id: Option<Uuid>,
     pub tags: Option<Vec<String>>,
     pub due_date: Option<DateTime<Utc>>,
     pub assigned_to: Option<Uuid>,
@@ -108,6 +118,7 @@ pub struct TaskResponse {
     pub status: TaskStatus,
     pub priority: Priority,
     pub category: Option<String>,
+    pub service_id: Option<Uuid>,
     pub tags: Vec<String>,
     pub due_date: Option<DateTime<Utc>>,
     pub created_by: Uuid,
@@ -117,11 +128,26 @@ pub struct TaskResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ServiceResponse {
+    pub id: Uuid,
+    pub name: String,
+}
+
 impl From<User> for UserResponse {
     fn from(user: User) -> Self {
         UserResponse {
             id: user.id,
             username: user.username,
+        }
+    }
+}
+
+impl From<Service> for ServiceResponse {
+    fn from(service: Service) -> Self {
+        ServiceResponse {
+            id: service.id,
+            name: service.name,
         }
     }
 }
