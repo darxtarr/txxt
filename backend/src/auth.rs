@@ -7,15 +7,9 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
-
-// JWT secret - in production, load from environment
-const JWT_SECRET: &[u8] = b"your-secret-key-change-in-production";
-const JWT_EXPIRY_HOURS: i64 = 24;
 
 // ── Auth request/response types (used to live in models.rs) ────
 
@@ -37,16 +31,6 @@ pub struct UserResponse {
     pub username: String,
 }
 
-// ── JWT ────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Claims {
-    pub sub: Uuid,        // user id
-    pub username: String,
-    pub exp: usize,       // expiry timestamp
-    pub iat: usize,       // issued at
-}
-
 // ── Shared state ───────────────────────────────────────────────
 
 pub struct AppState {
@@ -56,35 +40,6 @@ pub struct AppState {
 }
 
 pub type SharedState = Arc<AppState>;
-
-// ── Helpers ────────────────────────────────────────────────────
-
-pub fn create_token(user_id: Uuid, username: &str) -> Result<String, jsonwebtoken::errors::Error> {
-    let now = Utc::now();
-    let expiry = now + Duration::hours(JWT_EXPIRY_HOURS);
-
-    let claims = Claims {
-        sub: user_id,
-        username: username.to_string(),
-        exp: expiry.timestamp() as usize,
-        iat: now.timestamp() as usize,
-    };
-
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(JWT_SECRET),
-    )
-}
-
-pub fn verify_token(token: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
-    let token_data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(JWT_SECRET),
-        &Validation::default(),
-    )?;
-    Ok(token_data.claims)
-}
 
 fn verify_password(password: &str, hash: &str) -> bool {
     let parsed_hash = match PasswordHash::new(hash) {
@@ -112,8 +67,7 @@ pub async fn login(
         return Err((StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()));
     }
 
-    let token = create_token(user.id, &user.username)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let token = Uuid::new_v4().to_string();
 
     Ok(Json(LoginResponse {
         token,

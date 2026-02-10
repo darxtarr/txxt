@@ -24,7 +24,6 @@ pub mod msg {
     pub const TASK_UNSCHEDULED: u8 = 0x05;
     pub const TASK_COMPLETED: u8  = 0x06;
     pub const TASK_DELETED: u8    = 0x07;
-    pub const ERROR: u8           = 0xFF;
 
     // Client → Server
     pub const CMD_CREATE_TASK: u8    = 0x10;

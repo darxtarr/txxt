@@ -2,6 +2,11 @@
 
 Updated 2026-02-10. This is the source of truth for architectural decisions.
 
+## Profiling companion
+
+For performance-lab context, instrumentation rationale, and profiling workflow,
+see `backend/PROFILING.md` (branch workflow: `oxygen/profiling-lab`).
+
 ## What this is
 
 A Small Multiplayer Online (SMO) scheduling portal for 5-20 ops users on
@@ -248,8 +253,13 @@ The server decides what exists and where. IRONCLAD draws it.
 
 ### Security is deferred
 
-Dev-mode auth bypass active. Hardcoded JWT secret. Do not deploy publicly.
+Dev-mode auth bypass active on WS. Login token behavior is intentionally
+lightweight PoC mode. Do not deploy publicly.
 Hardening is a future phase after the system works.
+
+Current explicit defer list for dedicated hardening sessions:
+- Enforced WebSocket auth/authz
+- Flush-failure escalation policy (beyond logging/telemetry)
 
 ## Current backend state (updated 2026-02-10)
 
@@ -267,12 +277,12 @@ been removed. What exists now:
   default services/user. Tested with real redb files (4 tests).
 
 - **game.rs** — WebSocket handler at `/api/game`. On connect: subscribes to
-  broadcast, sends binary Snapshot, then enters command/event loop. Uses
-  postcard for wire serialization (interim — fixed-stride DataView planned).
+  broadcast, sends binary Snapshot, then enters command/event loop.
+  Fixed-stride binary protocol for snapshots + events.
 
 - **auth.rs** — Login handler at `POST /api/auth/login`. Reads users from
-  World (not from a separate database). JWT tokens. Dev-mode auth bypass on
-  WS (no token required yet).
+  World (not from a separate database). Lightweight token response for PoC.
+  Dev-mode auth bypass on WS (no token required yet).
 
 - **main.rs** — Boot sequence: open SaveFile → load World → seed defaults →
   create broadcast channel → start axum. ~90 lines.
@@ -288,20 +298,19 @@ been removed. What exists now:
 complete/delete), validation (day/time/duration bounds, status transitions),
 revision counter, event log, staging queue sorting, redb round-trips.
 
-## Dependencies — audit pending
+## Dependencies — audit in progress
 
-Current (11 direct deps, ~284 transitive):
-axum, tokio, redb, serde, serde_json, postcard, uuid, argon2, jsonwebtoken,
-tower-http, chrono, futures-util.
+Current runtime-focused set is intentionally slimmer than earlier PoC passes.
+Core deps: axum, tokio, redb, serde, postcard, uuid, argon2, tower-http.
 
-Cleaned 2026-02-10: removed `rand`, `tower 0.4`, `futures` (dead weight).
+Profiling-only tooling is feature-gated (`profile`, `profile-console`) and
+documented in `backend/PROFILING.md`.
 
 **Needs a deep analysis session:**
-- **jsonwebtoken** — heaviest dep (ring C/ASM crypto). Replace with session
-  tokens in redb, or HMAC-SHA256.
-- **tower-http** — ServeDir + CORS. Hand-rollable but tedious.
-- **chrono** — swap to `time` crate or timestamps-as-i64 when model finalizes.
-- **postcard** — interim. rkyv is the target for zero-copy.
+- **tower-http** — currently used for static serving; evaluate custom handler
+  only if profiling shows meaningful gain.
+- **postcard** — persistence-only right now; rkyv remains a future option if
+  it materially improves hot-path memory/serialization behavior.
 
 ## What's archived
 

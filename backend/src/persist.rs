@@ -6,6 +6,8 @@
 use crate::world::{Event, Service, Task, User, World};
 use redb::{Database, ReadableTable, TableDefinition};
 use std::sync::Arc;
+#[cfg(feature = "profile")]
+use std::time::Instant;
 use uuid::Uuid;
 
 // New tables — separate from the old db.rs tables so both coexist during transition.
@@ -86,11 +88,19 @@ impl SaveFile {
     /// Flush a single event to disk. Called after every World::apply().
     /// Writes the affected entity + updated revision in one transaction.
     pub fn flush(&self, world: &World, event: &Event) -> Result<(), SaveFileError> {
+        #[cfg(feature = "profile")]
+        let total_start = Instant::now();
         let txn = self.db.begin_write()?;
         {
+            #[cfg(feature = "profile")]
+            let table_start = Instant::now();
             let mut tasks = txn.open_table(WORLD_TASKS)?;
             let mut meta = txn.open_table(WORLD_META)?;
+            #[cfg(feature = "profile")]
+            tracing::debug!(elapsed_us = table_start.elapsed().as_micros() as u64, "flush opened tables");
 
+            #[cfg(feature = "profile")]
+            let write_start = Instant::now();
             match event {
                 Event::TaskCreated { task, .. } => {
                     let bytes = postcard::to_allocvec(task)
@@ -116,8 +126,14 @@ impl SaveFile {
 
             // Always update revision
             meta.insert("revision", world.revision.to_le_bytes().as_slice())?;
+            #[cfg(feature = "profile")]
+            tracing::debug!(elapsed_us = write_start.elapsed().as_micros() as u64, "flush wrote rows and revision");
         }
+        #[cfg(feature = "profile")]
+        let commit_start = Instant::now();
         txn.commit()?;
+        #[cfg(feature = "profile")]
+        tracing::debug!(elapsed_us = commit_start.elapsed().as_micros() as u64, total_us = total_start.elapsed().as_micros() as u64, "flush committed transaction");
         Ok(())
     }
 

@@ -3,18 +3,23 @@ name = "txxt-server"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+profile = ["dep:tracing", "dep:tracing-subscriber", "tokio/tracing"]
+profile-console = ["profile", "dep:console-subscriber"]
+
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 redb = "2"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 argon2 = "0.5"
-jsonwebtoken = "9"
 tower-http = { version = "0.5", features = ["fs", "cors"] }
-chrono = { version = "0.4", features = ["serde"] }
-futures-util = "0.3"
+tracing = { version = "0.1", features = ["attributes"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"], optional = true }
+console-subscriber = { version = "0.4", optional = true }
 
 [profile.release]
 lto = true
