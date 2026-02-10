@@ -57,6 +57,11 @@ async fn main() {
         game_tx,
     });
 
+    // ── Resolve IRONCLAD path relative to Cargo.toml ────────────
+    let ironclad_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../frontend");
+    println!("  Static:  {}", ironclad_dir.display());
+
     // ── Router ─────────────────────────────────────────────────
     let app = Router::new()
         // Auth (REST, JSON — called once per session)
@@ -65,7 +70,7 @@ async fn main() {
         // Game WebSocket (binary protocol — the real data path)
         .route("/api/game", get(game::ws_handler))
         // Static files — serve IRONCLAD renderer from txxt2 repo
-        .fallback_service(ServeDir::new("../../txxt2").append_index_html_on_directories(true))
+        .fallback_service(ServeDir::new(&ironclad_dir).append_index_html_on_directories(true))
         .with_state(state)
         .layer(
             CorsLayer::new()

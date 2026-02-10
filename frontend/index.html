@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IRONCLAD v0.6 — txxt</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header id="controls">
+        <span class="title">IRONCLAD v0.6</span>
+
+        <label>
+            Flashlight <output id="flash-val">150</output>px
+            <input type="range" id="flash-slider" min="20" max="500" step="10" value="150">
+        </label>
+
+        <span class="hint" id="status">Connecting...</span>
+
+        <button id="test-mode" style="margin-left:auto;font-size:11px;opacity:0.5">Test (500 random)</button>
+    </header>
+
+    <main id="engine-container"></main>
+
+    <script src="ironclad.js?v=6"></script>
+    <script>
+        const engine = new IroncladEngine('engine-container');
+        const statusEl = document.getElementById('status');
+
+        // Connect to game server
+        const wsUrl = 'ws://' + location.hostname + ':3000/api/game';
+        engine.connect(wsUrl);
+
+        // Update status indicator
+        setInterval(() => {
+            if (engine.connected) {
+                statusEl.textContent = 'Connected | rev ' + engine.revision + ' | ' + engine.count + ' tasks on grid';
+            } else {
+                statusEl.textContent = 'Disconnected — reconnecting...';
+            }
+        }, 500);
+
+        // Flashlight slider
+        const fSlider = document.getElementById('flash-slider');
+        const fVal    = document.getElementById('flash-val');
+        fSlider.addEventListener('input', () => {
+            const r = parseInt(fSlider.value);
+            fVal.textContent = r;
+            engine.setFlashlightRadius(r);
+        });
+
+        // Test mode fallback (generates random data, no server)
+        document.getElementById('test-mode').addEventListener('click', () => {
+            if (engine.ws_conn) {
+                engine.ws_conn.onclose = null; // prevent reconnect
+                engine.ws_conn.close();
+                engine.ws_conn = null;
+                engine.connected = false;
+            }
+            engine._generate(500);
+            statusEl.textContent = 'Test mode (500 random entities)';
+        });
+    </script>
+</body>
+</html>
