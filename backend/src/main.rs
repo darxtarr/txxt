@@ -64,8 +64,8 @@ async fn main() {
         .route("/api/auth/logout", post(auth::logout))
         // Game WebSocket (binary protocol — the real data path)
         .route("/api/game", get(game::ws_handler))
-        // Static files
-        .fallback_service(ServeDir::new("../frontend/dist").append_index_html_on_directories(true))
+        // Static files — serve IRONCLAD renderer from txxt2 repo
+        .fallback_service(ServeDir::new("../../txxt2").append_index_html_on_directories(true))
         .with_state(state)
         .layer(
             CorsLayer::new()
