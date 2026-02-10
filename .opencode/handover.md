@@ -1,73 +1,142 @@
-# Handover (2026-01-26)
+# Handover (2026-02-10, end of Opus session)
 
-This repo started as a one-shot prototype: Clay (C) -> WASM for UI layout, rendered via Canvas2D in the browser, backed by a single Rust server (axum + redb). Target environment is an enterprise CloudPC / remote desktop with no GPU acceleration: keep the UI crisp and reactive on CPU.
+## What this is
 
-## What Changed / Why
+txxt is a Small Multiplayer Online (SMO) scheduling portal. Game server
+architecture: Rust/axum owns all state in memory, browser clients are
+dumb renderers connected via binary WebSocket. NOT a web app.
 
-### 1) Sandbox + repo hygiene
-- Created `tmp/` as the repo-local scratch dir (and gitignored it).
-- Added a backend API smoke script at `backend/scripts/smoke_api.sh`.
-- Avoid `/tmp` for artifacts (sandbox can isolate it).
+## Current state: CLEAN, COMPILING, 30 TESTS PASSING
 
-### 2) Frontend performance + basic UX
-- Fixed the canvas loop so it no longer resizes the canvas every frame (huge CPU win on software rendering).
-- Added an on-canvas perf HUD (toggle `F2`): FPS + wasm ms + draw ms + command counts.
-- Fixed login input overlap/opacity by removing a CSS override that forced transparent backgrounds.
+```
+cargo test          # 30 tests pass (world: 17, wire: 9, persist: 4)
+cargo run           # boots server on :3000, serves frontend/
+```
 
-### 3) Clay/WASM linkage + debug tools
-- Clay’s wasm build expects an imported `clay.queryScrollOffsetFunction`; we provided a stub.
-- Added Clay debug tools toggle via `Ctrl+D` (avoid browser-reserved keys); it calls `Clay_SetDebugModeEnabled`.
+Nothing is half-done. No broken branches. No uncommitted changes that matter.
 
-### 4) The big one: stop parsing Clay structs in JS
-Problem: JS was reading Clay internal structs from WASM memory using hand-written struct definitions and hard-coded offsets. This is brittle across Clay versions/packing/alignment and caused “haunted UI” behavior.
+## Architecture (read DESIGN.md for full details)
 
-Fix: WASM now emits a stable packed command stream:
-- `frontend/main.c` packs Clay render commands into a fixed 64-byte-per-command buffer with a 16-byte header.
-- `frontend/dist/index.html` renders from this packed buffer (no Clay struct parsing in JS).
+```
+Client (frontend/ironclad.js)
+  ↕ binary WebSocket (fixed-stride packed structs)
+Server (backend/)
+  World (in-memory HashMap<Uuid, Entity>)
+  ↕ sync flush on every mutation
+  redb save file (tasks.redb)
+```
 
-Critical ABI fix:
-- `UpdateDrawFrame` previously returned a struct; in WASM that uses a hidden sret pointer and broke our assumptions about arguments.
-- `UpdateDrawFrame` now returns `void` and writes packed commands to the passed buffer address.
+**Key files:**
+- `backend/src/world.rs` — THE state machine. Command → apply() → Event. All mutations here.
+- `backend/src/wire.rs` — Binary protocol. 192-byte task records, 80-byte services. DataView-readable.
+- `backend/src/persist.rs` — redb wrapper. load_world() on boot, flush() on mutation.
+- `backend/src/game.rs` — WebSocket handler. Subscribe → snapshot → command loop.
+- `backend/src/auth.rs` — Login endpoint + JWT. Dev-mode bypass for WS.
+- `frontend/ironclad.js` — Canvas renderer. SoA arrays, flashlight UI, drag-drop.
+- `frontend/index.html` — Entry point. Connects to ws://hostname:3000/api/game
 
-### 5) Dev-mode auth bypass (temporary)
-To focus on layout/UX first, auth was bypassed:
-- Backend middleware treats missing Authorization as the default admin user.
-- Frontend skips login and goes straight to tasks.
+**Dead code** lives in `archive/backend-rest-era/` (old REST CRUD layer, kept for reference).
 
-This is intentionally temporary; tighten it later.
+## What was just built (this session)
 
-## Current State
+Phases 1-4 of the game server + IRONCLAD connection:
+1. World struct (pure state machine, zero IO)
+2. redb persistence (save file pattern)
+3. axum WebSocket handler (binary protocol)
+4. Fixed-stride wire protocol (no JSON anywhere)
+5. Connected IRONCLAD renderer to game server
+6. Consolidated txxt2 repo into txxt/frontend/
 
-- UI renders reliably again, including Clay debug tools.
-- We now have instrumentation (HUD) to guide CPU performance work.
-- The repo is currently dirty with changes after the earlier commit `fc839dd`.
+## NEXT TASK: Double-click to create
 
-## Goals
+User wants: double-click on calendar grid → create 30-minute task at that slot.
 
-- Crisp UI on CPU Canvas2D (CloudPC): no per-frame reallocations, minimal allocations in hot paths.
-- Keep Clay in its lane: immediate-mode layout + stable IDs; renderer stays dumb.
-- Minimal web stack: JS only as platform shim (IO + pixels), not “app framework”.
+**Implementation plan (4 touch points):**
 
-## Next Work (Recommended Order)
+### 1. world.rs — Add optional scheduling to CreateTask
 
-1) Kill JS task-struct offset poking
-- Right now task data is still being written into WASM memory by hard-coded offsets in JS. Replace with explicit WASM setters or a packed task input format.
+Add `day: Option<u8>, start_time: Option<u16>, duration: Option<u16>` to
+`Command::CreateTask`. In `apply()`, if all three are Some, validate and
+create as Scheduled directly. If None, create as Staged (existing behavior).
 
-2) Fix task identity end-to-end
-- Backend uses UUID; frontend currently uses `uint32_t id` for tasks. Make UUID a first-class ID in WASM state (string or 16 bytes) or provide a stable mapping layer.
+**Watch out:** There are ~6 places that construct `Command::CreateTask` —
+the enum definition, apply() match arm, test helper `create_task()`, and
+3 inline test calls. ALL must get the new fields or it won't compile.
 
-3) Stop full reload on WS events
-- Current client behavior is “WS event => reload all tasks”. Apply patches incrementally.
+### 2. wire.rs — Update CMD_CREATE_TASK (0x10) format
 
-4) Decide on animation model
-- Use WASM-owned animation state for panel transitions/hover/press to get “snappy feel” without needing a DOM framework.
+Current format:
+```
+[0]      type (0x10)
+[1]      priority
+[2..18]  service_id
+[18..34] assigned_to
+[34..]   title
+```
 
-## Controls
+New format (add scheduling between assigned_to and title):
+```
+[0]      type (0x10)
+[1]      priority
+[2..18]  service_id
+[18..34] assigned_to
+[34]     day (0xFF = no scheduling / staged)
+[35]     _pad
+[36..38] start_time (u16 LE)
+[38..40] duration (u16 LE)
+[40..]   title
+```
 
-- `F2`: perf HUD toggle.
-- `Ctrl+D`: Clay debug tools toggle.
+Update `unpack_command()` for CMD_CREATE_TASK: min length becomes 40,
+read day at [34] (0xFF → None, else Some), start_time/duration from LE u16s.
+Update the `unpack_create_task_command` test too.
 
-## Notes
+### 3. ironclad.js — Add dblclick handler + _sendCreateTask
 
-- Browser caching of WASM can be sticky; `index.html` loads `app.wasm` with a cachebust query.
-- If the UI ever goes white again, check the packed command header and `UpdateDrawFrame` signature first.
+- Add `CMD_CREATE_TASK: 0x10` to WIRE constants
+- Store `this.defaultServiceId` from first service in snapshot
+- Add `_sendCreateTask(day, startTime, duration)` method that packs the new format
+- Add `dblclick` handler in `_bindInput()`:
+  - Convert click pixel position to day + startTime (same math as _sendMoveTask)
+  - Duration = 30 (minutes, default)
+  - Title = "New task"
+  - Call `_sendCreateTask()`
+- The existing `_onTaskCreated` handler already handles scheduled tasks
+  (checks day !== 0xFF), so no changes needed there
+
+### 4. Optional: Relax grid validation
+
+INTERACTIONS.md mentions relaxing from 15-min to 5-min grid for future
+resize precision. Could do `% 5` instead of `% 15` in validate_scheduling().
+Not required for dblclick — 15-min snap is fine for now.
+
+## Future ideas (documented in INTERACTIONS.md)
+
+- Drag bottom edge to resize (same MoveTask command, different duration)
+- Alt+drag to clone (CreateTask with original's metadata + new position)
+- Different snap resolutions (30-min for move, 5-min for resize)
+- Modifier-click for manual time entry panel
+- Multi-day tasks: PUSHBACK — use cloning instead
+- Recurring tasks: PUSHBACK — separate subsystem later
+
+## User preferences (IMPORTANT)
+
+- **Always push to remote** after commits — CloudPC pulls from origin
+- Gamedev mindset, not webdev. Binary, not JSON. Simple, not enterprise.
+- Honest analysis > eager coding. Push back on bad ideas.
+- Full trust and authority given — make it shine, review later.
+- User might send GPT/Gemini to do work between sessions. Expect surprises.
+
+## How to run
+
+```bash
+cd backend && cargo run     # server on :3000
+# open http://localhost:3000 in browser
+# login: admin / admin (or skip — dev bypass on WS)
+```
+
+## How to test
+
+```bash
+cd backend && cargo test    # 30 tests, all should pass
+```
