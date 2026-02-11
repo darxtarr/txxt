@@ -218,8 +218,12 @@ pub fn unpack_command(data: &[u8]) -> Result<Command, WireError> {
             // [1]      priority (u8)
             // [2..18]  service_id (UUID)
             // [18..34] assigned_to (UUID, zeroed = none)
-            // [34..]   title (rest of frame, UTF-8, trimmed)
-            if data.len() < 34 {
+            // [34]     day (0xFF = no scheduling / staged)
+            // [35]     _pad
+            // [36..38] start_time (u16 LE)
+            // [38..40] duration (u16 LE)
+            // [40..]   title (rest of frame, UTF-8, trimmed)
+            if data.len() < 40 {
                 return Err(WireError::TooShort);
             }
             let priority = priority_from_u8(data[1])?;
@@ -228,9 +232,18 @@ pub fn unpack_command(data: &[u8]) -> Result<Command, WireError> {
                 let uuid = uuid_from_bytes(&data[18..34]);
                 if uuid.is_nil() { None } else { Some(uuid) }
             };
-            let title = string_from_bytes(&data[34..])?;
+            let (day, start_time, duration) = if data[34] == 0xFF {
+                (None, None, None)
+            } else {
+                (
+                    Some(data[34]),
+                    Some(u16::from_le_bytes([data[36], data[37]])),
+                    Some(u16::from_le_bytes([data[38], data[39]])),
+                )
+            };
+            let title = string_from_bytes(&data[40..])?;
 
-            Ok(Command::CreateTask { title, service_id, priority, assigned_to })
+            Ok(Command::CreateTask { title, service_id, priority, assigned_to, day, start_time, duration })
         }
 
         msg::CMD_SCHEDULE_TASK => {
@@ -479,21 +492,55 @@ mod tests {
     }
 
     #[test]
-    fn unpack_create_task_command() {
+    fn unpack_create_task_staged() {
         let svc_id = Uuid::from_bytes([0x11; 16]);
         let mut data = vec![msg::CMD_CREATE_TASK];
         data.push(3); // priority = Urgent
         data.extend_from_slice(svc_id.as_bytes());
         data.extend_from_slice(&[0u8; 16]); // assigned_to = none
+        data.push(0xFF); // day = staged
+        data.push(0);    // pad
+        data.extend_from_slice(&0u16.to_le_bytes());  // start_time (ignored)
+        data.extend_from_slice(&0u16.to_le_bytes());  // duration (ignored)
         data.extend_from_slice(b"Fix the pipeline");
 
         let cmd = unpack_command(&data).unwrap();
         match cmd {
-            Command::CreateTask { title, service_id, priority, assigned_to } => {
+            Command::CreateTask { title, service_id, priority, assigned_to, day, start_time, duration } => {
                 assert_eq!(title, "Fix the pipeline");
                 assert_eq!(service_id, svc_id);
                 assert_eq!(priority, Priority::Urgent);
                 assert_eq!(assigned_to, None);
+                assert_eq!(day, None);
+                assert_eq!(start_time, None);
+                assert_eq!(duration, None);
+            }
+            _ => panic!("expected CreateTask"),
+        }
+    }
+
+    #[test]
+    fn unpack_create_task_scheduled() {
+        let svc_id = Uuid::from_bytes([0x22; 16]);
+        let mut data = vec![msg::CMD_CREATE_TASK];
+        data.push(1); // priority = Medium
+        data.extend_from_slice(svc_id.as_bytes());
+        data.extend_from_slice(&[0u8; 16]); // assigned_to = none
+        data.push(2);   // day = Wednesday
+        data.push(0);   // pad
+        data.extend_from_slice(&540u16.to_le_bytes());  // start_time = 9:00
+        data.extend_from_slice(&30u16.to_le_bytes());   // duration = 30min
+        data.extend_from_slice(b"New task");
+
+        let cmd = unpack_command(&data).unwrap();
+        match cmd {
+            Command::CreateTask { title, service_id, priority, day, start_time, duration, .. } => {
+                assert_eq!(title, "New task");
+                assert_eq!(service_id, svc_id);
+                assert_eq!(priority, Priority::Medium);
+                assert_eq!(day, Some(2));
+                assert_eq!(start_time, Some(540));
+                assert_eq!(duration, Some(30));
             }
             _ => panic!("expected CreateTask"),
         }
