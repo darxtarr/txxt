@@ -13,8 +13,18 @@ cargo test          # 33 tests pass (world: 19, wire: 10, persist: 4)
 cargo run           # boots server on :3000, serves frontend/
 ```
 
-Branch: `oxygen/profiling-lab` — all pushed to remote.
+Branch: `main` — all feature work lives here. CloudPC pulls from main.
 Nothing is half-done. No uncommitted changes that matter.
+
+## Branch conventions (READ THIS)
+
+- **`main`** — all feature development. This is what CloudPC pulls. Always push here after commits.
+- **`oxygen/profiling-lab`** — profiling, benchmarking, and optimization sessions with Codex **only**.
+  Do NOT build features on this branch. The correct flow is:
+  1. Copy production code to profiling-lab
+  2. Run profiling harness / optimize
+  3. Cherry-pick optimized code back to main once done
+  4. Leave profiling tooling (PROFILING.md, scripts/) on the branch — it does not belong on main
 
 ## Architecture (read DESIGN.md for full details)
 
