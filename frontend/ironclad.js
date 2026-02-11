@@ -640,10 +640,11 @@ class IroncladEngine {
                 p.style.transform = `translate(${this.xs[idx]}px,${this.ys[idx]}px)`;
                 if (p.style.display !== 'block') p.style.display = 'block';
 
-                // Cursor hint: ns-resize near bottom edge, grab elsewhere
+                // Cursor hint: ns-resize near top/bottom edge, grab elsewhere
                 if (this.dragIdx < 0) {
-                    const bottomEdge = this.ys[idx] + this.hs[idx];
-                    p.style.cursor = Math.abs(this.mouseY - bottomEdge) < 8 ? 'ns-resize' : 'grab';
+                    const nearTop = Math.abs(this.mouseY - this.ys[idx]) < 8;
+                    const nearBot = Math.abs(this.mouseY - (this.ys[idx] + this.hs[idx])) < 8;
+                    p.style.cursor = (nearTop || nearBot) ? 'ns-resize' : 'grab';
                 }
             } else {
                 if (p.style.display !== 'none') p.style.display = 'none';
@@ -787,13 +788,18 @@ class IroncladEngine {
 
             if (this.dragIdx >= 0) {
                 this.dragInputTime = performance.now();
-                if (this.dragMode === 'resize') {
-                    // Resize: update height, clamp to minimum 15px (~15min)
-                    const newH = this.mouseY - this.ys[this.dragIdx];
-                    this.hs[this.dragIdx] = Math.max(SNAP_Y, newH);
+                const di = this.dragIdx;
+                if (this.dragMode === 'resize-bottom') {
+                    this.hs[di] = Math.max(SNAP_Y, this.mouseY - this.ys[di]);
+                } else if (this.dragMode === 'resize-top') {
+                    // Move top edge, keep bottom edge fixed
+                    const bottom = this.dragAnchorBottom;
+                    const newY = Math.min(this.mouseY, bottom - SNAP_Y);
+                    this.ys[di] = newY;
+                    this.hs[di] = bottom - newY;
                 } else {
-                    this.xs[this.dragIdx] = this.mouseX - this.dragOffX;
-                    this.ys[this.dragIdx] = this.mouseY - this.dragOffY;
+                    this.xs[di] = this.mouseX - this.dragOffX;
+                    this.ys[di] = this.mouseY - this.dragOffY;
                 }
                 this.dirty = true;
             }
@@ -828,13 +834,19 @@ class IroncladEngine {
             const idx = parseInt(t.dataset.idx);
             if (isNaN(idx) || idx < 0 || idx >= this.count) return;
 
-            // Detect resize: click within 8px of the bottom edge
-            const bottomEdge = this.ys[idx] + this.hs[idx];
+            // Detect resize: click within 8px of top or bottom edge
+            const topEdge = this.ys[idx];
+            const bottomEdge = topEdge + this.hs[idx];
             const nearBottom = Math.abs(this.mouseY - bottomEdge) < 8;
+            const nearTop = Math.abs(this.mouseY - topEdge) < 8;
 
             this.dragIdx = idx;
             if (nearBottom) {
-                this.dragMode = 'resize';
+                this.dragMode = 'resize-bottom';
+                t.style.cursor = 'ns-resize';
+            } else if (nearTop) {
+                this.dragMode = 'resize-top';
+                this.dragAnchorBottom = bottomEdge; // fixed edge
                 t.style.cursor = 'ns-resize';
             } else {
                 this.dragMode = 'move';
@@ -849,10 +861,14 @@ class IroncladEngine {
             if (this.dragIdx < 0) return;
             const i = this.dragIdx;
 
-            if (this.dragMode === 'resize') {
+            if (this.dragMode === 'resize-bottom') {
                 // Snap height to 15-min grid, minimum 15 minutes
-                const snappedH = Math.max(SNAP_Y, Math.round(this.hs[i] / SNAP_Y) * SNAP_Y);
-                this.hs[i] = snappedH;
+                this.hs[i] = Math.max(SNAP_Y, Math.round(this.hs[i] / SNAP_Y) * SNAP_Y);
+            } else if (this.dragMode === 'resize-top') {
+                // Snap top edge to grid, recalculate height from fixed bottom
+                const relY = this.ys[i] - CONFIG.TOP_HEADER;
+                this.ys[i] = Math.round(relY / SNAP_Y) * SNAP_Y + CONFIG.TOP_HEADER;
+                this.hs[i] = Math.max(SNAP_Y, this.dragAnchorBottom - this.ys[i]);
             } else {
                 // Snap Y to 15-min grid, relative to header offset
                 const relY = this.ys[i] - CONFIG.TOP_HEADER;
