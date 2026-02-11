@@ -39,13 +39,16 @@ day + start_time + duration.
 
 **Easy to build** once create is working. Same command, different UX.
 
-## Modifier-drag to clone (BUILD SOON)
+## Alt+drag to clone (DONE)
 
-Alt+drag (or Ctrl+drag) duplicates the task. The clone appears at the
-drop position with the same title/service/priority.
+Alt+drag duplicates the task. The clone appears at the drop position
+with the same title, service, and priority as the original.
 
-Under the hood: sends CreateTask with the original's metadata but the
-new position. Straightforward once CreateTask supports scheduling fields.
+Under the hood: on mousedown with Alt held, dragMode='clone' saves the
+original position. The entity visually follows the drag. On mouseup,
+the original snaps back to where it was and a CreateTask command is sent
+with the drop position and the original's metadata. The server creates the
+clone and broadcasts it; IRONCLAD adds it to the grid on TaskCreated.
 
 **Genuinely useful** for ops: "I'll do this again tomorrow for 4 hours."
 

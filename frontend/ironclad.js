@@ -1,8 +1,12 @@
 /**
- * IRONCLAD ENGINE v0.6 — Server-Connected Build
+ * IRONCLAD ENGINE v0.7 — Server-Connected Build
  *
  * Canvas/DOM hybrid renderer for time tracking on software-rendered CloudPCs.
  * No dependencies. No build step.
+ *
+ * v0.7: Alt+drag to clone tasks. SoA now stores raw priority and service UUID
+ *        per entity so clones carry full metadata. _sendCreateTask accepts
+ *        optional title/priority/serviceId params (defaults for dblclick).
  *
  * v0.6: WebSocket connection to txxt game server. Binary wire protocol.
  *        Fixed-stride packed records read via DataView. No JSON.
@@ -125,14 +129,16 @@ class IroncladEngine {
 
         // ── SoA entity storage ──
         this.count = 0;
-        this.ids   = new Int32Array(CONFIG.MAX_ENTITIES);
-        this.xs    = new Float32Array(CONFIG.MAX_ENTITIES);
-        this.ys    = new Float32Array(CONFIG.MAX_ENTITIES);
-        this.ws    = new Float32Array(CONFIG.MAX_ENTITIES);
-        this.hs    = new Float32Array(CONFIG.MAX_ENTITIES);
-        this.types = new Uint8Array(CONFIG.MAX_ENTITIES);
-        this.labels = new Array(CONFIG.MAX_ENTITIES); // strings can't live in typed arrays
-        this.uuids = new Uint8Array(CONFIG.MAX_ENTITIES * 16); // 16-byte UUIDs, flat
+        this.ids        = new Int32Array(CONFIG.MAX_ENTITIES);
+        this.xs         = new Float32Array(CONFIG.MAX_ENTITIES);
+        this.ys         = new Float32Array(CONFIG.MAX_ENTITIES);
+        this.ws         = new Float32Array(CONFIG.MAX_ENTITIES);
+        this.hs         = new Float32Array(CONFIG.MAX_ENTITIES);
+        this.types      = new Uint8Array(CONFIG.MAX_ENTITIES);
+        this.priorities = new Uint8Array(CONFIG.MAX_ENTITIES);          // raw priority 0-3
+        this.labels     = new Array(CONFIG.MAX_ENTITIES);               // strings can't live in typed arrays
+        this.uuids      = new Uint8Array(CONFIG.MAX_ENTITIES * 16);     // 16-byte UUIDs, flat
+        this.serviceIds = new Uint8Array(CONFIG.MAX_ENTITIES * 16);     // 16-byte service UUIDs, flat
 
         // ── Server connection state ──
         this.ws_conn = null;
@@ -173,10 +179,12 @@ class IroncladEngine {
 
         // ── Drag state ──
         this.dragIdx = -1;
-        this.dragMode = 'move'; // 'move' or 'resize'
+        this.dragMode = 'move'; // 'move', 'resize-top', 'resize-bottom', 'clone'
         this.dragOffX = 0;
         this.dragOffY = 0;
         this.dragInputTime = 0;
+        this.cloneOriginX = 0; // original position saved on clone drag start
+        this.cloneOriginY = 0;
 
         // ── Perf ring buffer ──
         this.frameTimes = new Float64Array(60);
@@ -322,10 +330,11 @@ class IroncladEngine {
         const duration  = view.getUint16(off + WIRE.TASK_DURATION, true);
         const priority  = view.getUint8(off + WIRE.TASK_PRIORITY);
 
-        // Store UUID (16 bytes)
+        // Store UUID and service UUID (16 bytes each)
         const uuidOff = idx * 16;
-        const src = new Uint8Array(buffer, off + WIRE.TASK_ID, 16);
-        this.uuids.set(src, uuidOff);
+        this.uuids.set(new Uint8Array(buffer, off + WIRE.TASK_ID, 16), uuidOff);
+        this.serviceIds.set(new Uint8Array(buffer, off + WIRE.TASK_SERVICE_ID, 16), uuidOff);
+        this.priorities[idx] = priority;
 
         // Convert scheduling data to pixel coordinates
         const pad = 10;
@@ -465,12 +474,17 @@ class IroncladEngine {
 
     // ── Send CreateTask command to server ──────────────────────────
 
-    _sendCreateTask(day, startTime, duration) {
+    // title/priority/serviceId are optional — used when cloning an existing task.
+    // Defaults: 'New task', Medium priority, defaultServiceId.
+    _sendCreateTask(day, startTime, duration, title, priority, serviceId) {
         if (!this.ws_conn || this.ws_conn.readyState !== WebSocket.OPEN) return;
         if (!this.defaultServiceId) return;
 
-        const title = 'New task';
-        const titleBytes = new TextEncoder().encode(title);
+        const titleStr   = title    !== undefined ? title    : 'New task';
+        const prio       = priority !== undefined ? priority : 1; // Medium
+        const svcId      = serviceId !== undefined ? serviceId : this.defaultServiceId;
+
+        const titleBytes = new TextEncoder().encode(titleStr);
 
         // Pack: [type:u8][priority:u8][service_id:16][assigned_to:16][day:u8][pad:u8][start:u16][dur:u16][title...]
         const buf = new ArrayBuffer(40 + titleBytes.length);
@@ -478,8 +492,8 @@ class IroncladEngine {
         const arr = new Uint8Array(buf);
 
         arr[0] = WIRE.CMD_CREATE_TASK;
-        arr[1] = 1; // priority = Medium
-        arr.set(this.defaultServiceId, 2);       // service_id at [2..18]
+        arr[1] = prio;
+        arr.set(svcId, 2);                        // service_id at [2..18]
         // assigned_to at [18..34] stays zeroed (none)
         arr[34] = day;                            // day
         arr[35] = 0;                              // pad
@@ -508,14 +522,16 @@ class IroncladEngine {
         const last = this.count - 1;
         if (idx !== last) {
             // Copy last entity into the removed slot
-            this.ids[idx]   = this.ids[last];
-            this.xs[idx]    = this.xs[last];
-            this.ys[idx]    = this.ys[last];
-            this.ws[idx]    = this.ws[last];
-            this.hs[idx]    = this.hs[last];
-            this.types[idx] = this.types[last];
-            this.labels[idx] = this.labels[last];
+            this.ids[idx]        = this.ids[last];
+            this.xs[idx]         = this.xs[last];
+            this.ys[idx]         = this.ys[last];
+            this.ws[idx]         = this.ws[last];
+            this.hs[idx]         = this.hs[last];
+            this.types[idx]      = this.types[last];
+            this.priorities[idx] = this.priorities[last];
+            this.labels[idx]     = this.labels[last];
             this.uuids.copyWithin(idx * 16, last * 16, last * 16 + 16);
+            this.serviceIds.copyWithin(idx * 16, last * 16, last * 16 + 16);
         }
         this.count--;
     }
@@ -640,7 +656,7 @@ class IroncladEngine {
                 p.style.transform = `translate(${this.xs[idx]}px,${this.ys[idx]}px)`;
                 if (p.style.display !== 'block') p.style.display = 'block';
 
-                // Cursor hint: ns-resize near top/bottom edge, grab elsewhere
+                // Cursor hint: copy if Alt held, ns-resize near edges, grab elsewhere
                 if (this.dragIdx < 0) {
                     const nearTop = Math.abs(this.mouseY - this.ys[idx]) < 8;
                     const nearBot = Math.abs(this.mouseY - (this.ys[idx] + this.hs[idx])) < 8;
@@ -841,7 +857,15 @@ class IroncladEngine {
             const nearTop = Math.abs(this.mouseY - topEdge) < 8;
 
             this.dragIdx = idx;
-            if (nearBottom) {
+            if (e.altKey) {
+                // Alt+drag: clone mode — drag a ghost, original stays put
+                this.dragMode = 'clone';
+                this.cloneOriginX = this.xs[idx];
+                this.cloneOriginY = this.ys[idx];
+                this.dragOffX = this.mouseX - this.xs[idx];
+                this.dragOffY = this.mouseY - this.ys[idx];
+                t.style.cursor = 'copy';
+            } else if (nearBottom) {
                 this.dragMode = 'resize-bottom';
                 t.style.cursor = 'ns-resize';
             } else if (nearTop) {
@@ -861,29 +885,45 @@ class IroncladEngine {
             if (this.dragIdx < 0) return;
             const i = this.dragIdx;
 
-            if (this.dragMode === 'resize-bottom') {
+            if (this.dragMode === 'clone') {
+                // Snap drop position to grid
+                const relY = this.ys[i] - CONFIG.TOP_HEADER;
+                const snappedY = Math.round(relY / SNAP_Y) * SNAP_Y + CONFIG.TOP_HEADER;
+                const col = Math.round((this.xs[i] - CONFIG.LEFT_GUTTER - 10) / CONFIG.DAY_WIDTH);
+                const day = Math.max(0, Math.min(col, CONFIG.DAYS - 1));
+                const startTime = Math.round(((snappedY - CONFIG.TOP_HEADER) / CONFIG.HOUR_HEIGHT + CONFIG.START_HOUR) * 60 / 15) * 15;
+                const duration  = Math.max(15, Math.round((this.hs[i] / CONFIG.HOUR_HEIGHT) * 60 / 15) * 15);
+
+                // Send clone as a new task with the original's metadata
+                if (this.connected) {
+                    const title     = this.labels[i][0];
+                    const priority  = this.priorities[i];
+                    const serviceId = this.serviceIds.subarray(i * 16, i * 16 + 16);
+                    this._sendCreateTask(day, startTime, duration, title, priority, serviceId);
+                }
+
+                // Restore original to where it was — server will add the clone separately
+                this.xs[i] = this.cloneOriginX;
+                this.ys[i] = this.cloneOriginY;
+
+            } else if (this.dragMode === 'resize-bottom') {
                 // Snap height to 15-min grid, minimum 15 minutes
                 this.hs[i] = Math.max(SNAP_Y, Math.round(this.hs[i] / SNAP_Y) * SNAP_Y);
+                if (this.connected) this._sendMoveTask(i);
             } else if (this.dragMode === 'resize-top') {
                 // Snap top edge to grid, recalculate height from fixed bottom
                 const relY = this.ys[i] - CONFIG.TOP_HEADER;
                 this.ys[i] = Math.round(relY / SNAP_Y) * SNAP_Y + CONFIG.TOP_HEADER;
                 this.hs[i] = Math.max(SNAP_Y, this.dragAnchorBottom - this.ys[i]);
+                if (this.connected) this._sendMoveTask(i);
             } else {
-                // Snap Y to 15-min grid, relative to header offset
+                // Move: snap Y to 15-min grid, X to day column
                 const relY = this.ys[i] - CONFIG.TOP_HEADER;
                 this.ys[i] = Math.round(relY / SNAP_Y) * SNAP_Y + CONFIG.TOP_HEADER;
-
-                // Snap X to day column
                 const col = Math.round((this.xs[i] - CONFIG.LEFT_GUTTER - 10) / CONFIG.DAY_WIDTH);
                 const clamped = Math.max(0, Math.min(col, CONFIG.DAYS - 1));
                 this.xs[i] = CONFIG.LEFT_GUTTER + clamped * CONFIG.DAY_WIDTH + 10;
-            }
-
-            // Send move command to server (if connected)
-            // MoveTask carries day + start_time + duration, works for both move and resize
-            if (this.connected) {
-                this._sendMoveTask(i);
+                if (this.connected) this._sendMoveTask(i);
             }
 
             this._rebuildIndex();
