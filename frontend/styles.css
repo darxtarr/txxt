@@ -91,6 +91,7 @@ body {
     flex: 1;
     background: #0e0e12;
     min-height: 0;
+    user-select: none;
 }
 
 /* ── Stats overlay (created by engine) ───────────────────────────────────── */

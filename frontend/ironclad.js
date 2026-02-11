@@ -787,6 +787,7 @@ class IroncladEngine {
         });
 
         this.container.addEventListener('dblclick', (e) => {
+            e.preventDefault();
             if (!this.connected) return;
             const r = this.container.getBoundingClientRect();
             const mx = e.clientX - r.left;
