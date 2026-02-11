@@ -337,6 +337,9 @@ mod tests {
                 service_id: svc_id,
                 priority: Priority::High,
                 assigned_to: None,
+                day: None,
+                start_time: None,
+                duration: None,
             },
             user_id,
         ).unwrap();
@@ -389,6 +392,9 @@ mod tests {
                 service_id: svc_id,
                 priority: Priority::Low,
                 assigned_to: None,
+                day: None,
+                start_time: None,
+                duration: None,
             },
             Uuid::nil(),
         ).unwrap();

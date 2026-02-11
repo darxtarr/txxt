@@ -317,6 +317,28 @@ documented in `backend/PROFILING.md`.
 `archive/` contains the Clay/WASM era: dead frontend, old handover docs,
 screenshots, scratch files. Kept for reference.
 
+## Interaction model — how users touch the grid
+
+All scheduling happens through direct manipulation on the calendar canvas.
+No forms, no modals, no dropdowns. The grid IS the interface.
+
+| Gesture              | Action         | Status   |
+|----------------------|----------------|----------|
+| Drag task            | Move to slot   | DONE     |
+| Double-click grid    | Create 30m task| NEXT     |
+| Drag bottom edge     | Resize duration| PLANNED  |
+| Alt+drag (mod-drag)  | Clone task     | PLANNED  |
+| Modifier-click       | Manual entry   | DEFERRED |
+
+**Snap resolution** (planned): moves snap to 30 minutes (coarse),
+resizes snap to 5 minutes (fine). Currently everything is 15-minute grid.
+
+All gestures produce binary WS commands — the server validates and
+broadcasts. The client never mutates local state optimistically.
+
+See `INTERACTIONS.md` for detailed rationale, edge cases, and pushback
+on multi-day / recurring tasks.
+
 ## Philosophy
 
 - This is a game server, not a web API.

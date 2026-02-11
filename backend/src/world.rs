@@ -73,6 +73,11 @@ pub enum Command {
         service_id: Uuid,
         priority: Priority,
         assigned_to: Option<Uuid>,
+        /// If all three scheduling fields are Some, create directly as Scheduled.
+        /// If None, create as Staged (existing behavior).
+        day: Option<u8>,
+        start_time: Option<u16>,
+        duration: Option<u16>,
     },
     ScheduleTask {
         task_id: Uuid,
@@ -177,23 +182,32 @@ impl World {
     /// This is THE mutation codepath — every state change goes through here.
     pub fn apply(&mut self, cmd: Command, user_id: Uuid) -> Result<Event, WorldError> {
         match cmd {
-            Command::CreateTask { title, service_id, priority, assigned_to } => {
+            Command::CreateTask { title, service_id, priority, assigned_to, day, start_time, duration } => {
                 // Validate: service must exist
                 if !self.services.contains_key(&service_id) {
                     return Err(WorldError::ServiceNotFound);
                 }
 
+                // If all scheduling fields provided, validate and create as Scheduled
+                let (status, day, start_time, duration) = match (day, start_time, duration) {
+                    (Some(d), Some(st), Some(dur)) => {
+                        validate_scheduling(d, st, dur)?;
+                        (TaskStatus::Scheduled, Some(d), Some(st), Some(dur))
+                    }
+                    _ => (TaskStatus::Staged, None, None, None),
+                };
+
                 let task = Task {
                     id: Uuid::new_v4(),
                     title,
-                    status: TaskStatus::Staged,
+                    status,
                     priority,
                     service_id,
                     created_by: user_id,
                     assigned_to,
-                    day: None,
-                    start_time: None,
-                    duration: None,
+                    day,
+                    start_time,
+                    duration,
                 };
 
                 self.revision += 1;
@@ -388,6 +402,9 @@ mod tests {
                 service_id: Uuid::nil(),
                 priority: Priority::Medium,
                 assigned_to: None,
+                day: None,
+                start_time: None,
+                duration: None,
             },
             Uuid::nil(), // user_id
         ).unwrap();
@@ -411,6 +428,52 @@ mod tests {
     }
 
     #[test]
+    fn create_task_with_scheduling() {
+        let mut w = test_world();
+        let event = w.apply(
+            Command::CreateTask {
+                title: "New task".into(),
+                service_id: Uuid::nil(),
+                priority: Priority::Medium,
+                assigned_to: None,
+                day: Some(2),
+                start_time: Some(540),
+                duration: Some(30),
+            },
+            Uuid::nil(),
+        ).unwrap();
+
+        let id = match event {
+            Event::TaskCreated { task, .. } => task.id,
+            _ => panic!("expected TaskCreated"),
+        };
+
+        let task = &w.tasks[&id];
+        assert_eq!(task.status, TaskStatus::Scheduled);
+        assert_eq!(task.day, Some(2));
+        assert_eq!(task.start_time, Some(540));
+        assert_eq!(task.duration, Some(30));
+    }
+
+    #[test]
+    fn create_task_with_bad_scheduling() {
+        let mut w = test_world();
+        let result = w.apply(
+            Command::CreateTask {
+                title: "Bad".into(),
+                service_id: Uuid::nil(),
+                priority: Priority::Medium,
+                assigned_to: None,
+                day: Some(9), // invalid day
+                start_time: Some(540),
+                duration: Some(30),
+            },
+            Uuid::nil(),
+        );
+        assert_eq!(result.unwrap_err(), WorldError::InvalidDay);
+    }
+
+    #[test]
     fn create_task_requires_valid_service() {
         let mut w = World::new(); // no services
         let result = w.apply(
@@ -419,6 +482,9 @@ mod tests {
                 service_id: Uuid::new_v4(),
                 priority: Priority::Low,
                 assigned_to: None,
+                day: None,
+                start_time: None,
+                duration: None,
             },
             Uuid::nil(),
         );
@@ -566,16 +632,19 @@ mod tests {
         w.apply(Command::CreateTask {
             title: "Low".into(), service_id: Uuid::nil(),
             priority: Priority::Low, assigned_to: None,
+            day: None, start_time: None, duration: None,
         }, user).unwrap();
 
         w.apply(Command::CreateTask {
             title: "Urgent".into(), service_id: Uuid::nil(),
             priority: Priority::Urgent, assigned_to: None,
+            day: None, start_time: None, duration: None,
         }, user).unwrap();
 
         w.apply(Command::CreateTask {
             title: "High".into(), service_id: Uuid::nil(),
             priority: Priority::High, assigned_to: None,
+            day: None, start_time: None, duration: None,
         }, user).unwrap();
 
         let queue = w.staging_queue();

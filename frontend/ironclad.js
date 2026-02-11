@@ -89,6 +89,7 @@ const WIRE = {
     TASK_DELETED:     0x07,
 
     // Client → Server command types
+    CMD_CREATE_TASK:  0x10,
     CMD_MOVE_TASK:    0x12,
 
     // Record strides (bytes)
@@ -137,6 +138,7 @@ class IroncladEngine {
         this.ws_conn = null;
         this.revision = 0;
         this.connected = false;
+        this.defaultServiceId = null; // Uint8Array(16), set from first service in snapshot
 
         // ── Spatial index: array-of-arrays, reused via length reset ──
         this.buckets = new Array(CONFIG.MAX_BUCKETS);
@@ -296,6 +298,13 @@ class IroncladEngine {
         }
 
         this.count = idx;
+
+        // Grab the first service ID for double-click create
+        if (svcCount > 0) {
+            const svcOff = base + taskCount * WIRE.TASK_STRIDE;
+            this.defaultServiceId = new Uint8Array(buffer, svcOff + WIRE.SVC_ID, 16).slice();
+        }
+
         this._rebuildIndex();
         this.dirty = true;
         this.prevMX = -9999; // force flashlight refresh
@@ -449,6 +458,33 @@ class IroncladEngine {
         arr[17] = day;
         v.setUint16(18, startTime, true);
         v.setUint16(20, duration, true);
+
+        this.ws_conn.send(buf);
+    }
+
+    // ── Send CreateTask command to server ──────────────────────────
+
+    _sendCreateTask(day, startTime, duration) {
+        if (!this.ws_conn || this.ws_conn.readyState !== WebSocket.OPEN) return;
+        if (!this.defaultServiceId) return;
+
+        const title = 'New task';
+        const titleBytes = new TextEncoder().encode(title);
+
+        // Pack: [type:u8][priority:u8][service_id:16][assigned_to:16][day:u8][pad:u8][start:u16][dur:u16][title...]
+        const buf = new ArrayBuffer(40 + titleBytes.length);
+        const v = new DataView(buf);
+        const arr = new Uint8Array(buf);
+
+        arr[0] = WIRE.CMD_CREATE_TASK;
+        arr[1] = 1; // priority = Medium
+        arr.set(this.defaultServiceId, 2);       // service_id at [2..18]
+        // assigned_to at [18..34] stays zeroed (none)
+        arr[34] = day;                            // day
+        arr[35] = 0;                              // pad
+        v.setUint16(36, startTime, true);         // start_time
+        v.setUint16(38, duration, true);          // duration
+        arr.set(titleBytes, 40);                  // title
 
         this.ws_conn.send(buf);
     }
@@ -748,6 +784,28 @@ class IroncladEngine {
                 this.ys[this.dragIdx] = this.mouseY - this.dragOffY;
                 this.dirty = true;
             }
+        });
+
+        this.container.addEventListener('dblclick', (e) => {
+            if (!this.connected) return;
+            const r = this.container.getBoundingClientRect();
+            const mx = e.clientX - r.left;
+            const my = e.clientY - r.top;
+
+            // Must be inside the grid area
+            if (mx < CONFIG.LEFT_GUTTER || my < CONFIG.TOP_HEADER) return;
+
+            // Convert pixel position to day + startTime
+            const col = ((mx - CONFIG.LEFT_GUTTER) / CONFIG.DAY_WIDTH) | 0;
+            if (col >= CONFIG.DAYS) return;
+
+            const relMinutes = ((my - CONFIG.TOP_HEADER) / CONFIG.HOUR_HEIGHT + CONFIG.START_HOUR) * 60;
+            const startTime = Math.round(relMinutes / 15) * 15;
+
+            // Clamp: don't go past end of visible grid
+            if (startTime < CONFIG.START_HOUR * 60 || startTime + 30 > CONFIG.END_HOUR * 60) return;
+
+            this._sendCreateTask(col, startTime, 30);
         });
 
         this.container.addEventListener('mousedown', (e) => {
