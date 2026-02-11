@@ -317,7 +317,7 @@ No forms, no modals, no dropdowns. The grid IS the interface.
 |----------------------|----------------|----------|
 | Drag task            | Move to slot   | DONE     |
 | Double-click grid    | Create 30m task| NEXT     |
-| Drag bottom edge     | Resize duration| PLANNED  |
+| Drag bottom edge     | Resize duration| DONE     |
 | Alt+drag (mod-drag)  | Clone task     | PLANNED  |
 | Modifier-click       | Manual entry   | DEFERRED |
 

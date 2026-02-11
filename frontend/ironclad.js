@@ -173,6 +173,7 @@ class IroncladEngine {
 
         // ── Drag state ──
         this.dragIdx = -1;
+        this.dragMode = 'move'; // 'move' or 'resize'
         this.dragOffX = 0;
         this.dragOffY = 0;
         this.dragInputTime = 0;
@@ -638,6 +639,12 @@ class IroncladEngine {
                 }
                 p.style.transform = `translate(${this.xs[idx]}px,${this.ys[idx]}px)`;
                 if (p.style.display !== 'block') p.style.display = 'block';
+
+                // Cursor hint: ns-resize near bottom edge, grab elsewhere
+                if (this.dragIdx < 0) {
+                    const bottomEdge = this.ys[idx] + this.hs[idx];
+                    p.style.cursor = Math.abs(this.mouseY - bottomEdge) < 8 ? 'ns-resize' : 'grab';
+                }
             } else {
                 if (p.style.display !== 'none') p.style.display = 'none';
             }
@@ -780,8 +787,14 @@ class IroncladEngine {
 
             if (this.dragIdx >= 0) {
                 this.dragInputTime = performance.now();
-                this.xs[this.dragIdx] = this.mouseX - this.dragOffX;
-                this.ys[this.dragIdx] = this.mouseY - this.dragOffY;
+                if (this.dragMode === 'resize') {
+                    // Resize: update height, clamp to minimum 15px (~15min)
+                    const newH = this.mouseY - this.ys[this.dragIdx];
+                    this.hs[this.dragIdx] = Math.max(SNAP_Y, newH);
+                } else {
+                    this.xs[this.dragIdx] = this.mouseX - this.dragOffX;
+                    this.ys[this.dragIdx] = this.mouseY - this.dragOffY;
+                }
                 this.dirty = true;
             }
         });
@@ -815,10 +828,20 @@ class IroncladEngine {
             const idx = parseInt(t.dataset.idx);
             if (isNaN(idx) || idx < 0 || idx >= this.count) return;
 
+            // Detect resize: click within 8px of the bottom edge
+            const bottomEdge = this.ys[idx] + this.hs[idx];
+            const nearBottom = Math.abs(this.mouseY - bottomEdge) < 8;
+
             this.dragIdx = idx;
-            this.dragOffX = this.mouseX - this.xs[idx];
-            this.dragOffY = this.mouseY - this.ys[idx];
-            t.style.cursor = 'grabbing';
+            if (nearBottom) {
+                this.dragMode = 'resize';
+                t.style.cursor = 'ns-resize';
+            } else {
+                this.dragMode = 'move';
+                this.dragOffX = this.mouseX - this.xs[idx];
+                this.dragOffY = this.mouseY - this.ys[idx];
+                t.style.cursor = 'grabbing';
+            }
             e.preventDefault();
         });
 
@@ -826,16 +849,23 @@ class IroncladEngine {
             if (this.dragIdx < 0) return;
             const i = this.dragIdx;
 
-            // Snap Y to 15-min grid, relative to header offset
-            const relY = this.ys[i] - CONFIG.TOP_HEADER;
-            this.ys[i] = Math.round(relY / SNAP_Y) * SNAP_Y + CONFIG.TOP_HEADER;
+            if (this.dragMode === 'resize') {
+                // Snap height to 15-min grid, minimum 15 minutes
+                const snappedH = Math.max(SNAP_Y, Math.round(this.hs[i] / SNAP_Y) * SNAP_Y);
+                this.hs[i] = snappedH;
+            } else {
+                // Snap Y to 15-min grid, relative to header offset
+                const relY = this.ys[i] - CONFIG.TOP_HEADER;
+                this.ys[i] = Math.round(relY / SNAP_Y) * SNAP_Y + CONFIG.TOP_HEADER;
 
-            // Snap X to day column
-            const col = Math.round((this.xs[i] - CONFIG.LEFT_GUTTER - 10) / CONFIG.DAY_WIDTH);
-            const clamped = Math.max(0, Math.min(col, CONFIG.DAYS - 1));
-            this.xs[i] = CONFIG.LEFT_GUTTER + clamped * CONFIG.DAY_WIDTH + 10;
+                // Snap X to day column
+                const col = Math.round((this.xs[i] - CONFIG.LEFT_GUTTER - 10) / CONFIG.DAY_WIDTH);
+                const clamped = Math.max(0, Math.min(col, CONFIG.DAYS - 1));
+                this.xs[i] = CONFIG.LEFT_GUTTER + clamped * CONFIG.DAY_WIDTH + 10;
+            }
 
             // Send move command to server (if connected)
+            // MoveTask carries day + start_time + duration, works for both move and resize
             if (this.connected) {
                 this._sendMoveTask(i);
             }
@@ -843,6 +873,7 @@ class IroncladEngine {
             this._rebuildIndex();
             this.dirty = true;
             this.dragIdx = -1;
+            this.dragMode = 'move';
             this.dragInputTime = 0;
             for (let p = 0; p < this.pool.length; p++) this.pool[p].style.cursor = 'grab';
         });

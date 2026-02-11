@@ -2,7 +2,13 @@
 
 Ideas captured 2026-02-10. Honest assessment of each.
 
-## Double-click to create (BUILD NOW)
+## Known quirks
+
+- **Double-click blocked by browser extensions:** Some extensions intercept
+  dblclick events. If double-click-to-create doesn't work, try incognito.
+  Confirmed working in clean profiles across Chrome/Edge/Firefox.
+
+## Double-click to create (DONE)
 
 Double-click on the calendar grid → create a 30-minute task at that slot.
 Default title "New task", default service, Medium priority.
@@ -21,7 +27,7 @@ command, broadcasts to all clients.
 **Current snap:** 15-minute grid (SNAP_Y = HOUR_HEIGHT / 4 = 15px).
 Could relax to 30-minute snap for moves (see snap resolution below).
 
-## Drag to resize (BUILD SOON)
+## Drag to resize (DONE)
 
 Grab the bottom edge of a task → drag to change duration.
 Detection: if mousedown is within ~8px of the bottom edge, it's a
