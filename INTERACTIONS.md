@@ -52,6 +52,11 @@ clone and broadcasts it; IRONCLAD adds it to the grid on TaskCreated.
 
 **Genuinely useful** for ops: "I'll do this again tomorrow for 4 hours."
 
+**Beautification TODO:** Show a ghost (semi-transparent copy) at the original
+position while Alt+dragging, so it's visually clear you're cloning not moving.
+Likely a canvas-only tweak during the render pass — draw a faded rect at
+cloneOriginX/Y when dragMode='clone'. Defer to the chrome/palette session.
+
 ## Different snap resolutions (BUILD SOON)
 
 - **Move:** snap to 30 minutes (coarse positioning — "put it at 2pm")
