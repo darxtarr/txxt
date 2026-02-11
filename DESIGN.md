@@ -249,7 +249,27 @@ The server decides what exists and where. IRONCLAD draws it.
 ### Security is deferred
 
 Dev-mode auth bypass active. Hardcoded JWT secret. Do not deploy publicly.
-Hardening is a future phase after the system works.
+Hardening is a future phase after the system works. This is an internal tool
+for a known workgroup — if it ever graduates to a wider deployment, that will
+be a different project with proper SDLC and security review from scratch.
+
+### No protocol versioning — intentional
+
+There are no version bytes in the wire format. This is a deliberate decision,
+not an oversight.
+
+Protocol versioning exists to handle clients and servers running different
+versions simultaneously. That problem does not exist here: server and clients
+are always deployed together from the same repo. When the wire format changes,
+both sides are updated in the same commit. There is no window where a v1 client
+talks to a v2 server.
+
+Adding version negotiation would be complexity solving a problem we don't have.
+Wire format changes are breaking changes by definition — the correct response is
+to update everything and redeploy, not to pad frames with compatibility shims.
+
+The audience is ops engineers, not passive users. Anyone on the team can read
+the wire format in `wire.rs` and fix a mismatch in minutes. Keep it lean.
 
 ## Current backend state (updated 2026-02-10)
 
