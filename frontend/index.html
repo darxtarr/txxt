@@ -3,12 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IRONCLAD v0.7 — txxt</title>
+    <title>IRONCLAD v0.8 — txxt</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <header id="controls">
-        <span class="title">IRONCLAD v0.7</span>
+        <span class="title">IRONCLAD v0.8</span>
 
         <label>
             Flashlight <output id="flash-val">150</output>px
@@ -22,7 +22,7 @@
 
     <main id="engine-container"></main>
 
-    <script src="ironclad.js?v=7"></script>
+    <script src="ironclad.js?v=8"></script>
     <script>
         const engine = new IroncladEngine('engine-container');
         const statusEl = document.getElementById('status');
@@ -49,13 +49,8 @@
             engine.setFlashlightRadius(r);
         });
 
-        // Alt-C: Quake/Yakuake-style calendar collapse — slides from left
-        document.addEventListener('keydown', (e) => {
-            if (e.altKey && e.key === 'c') {
-                e.preventDefault();
-                document.getElementById('engine-container').classList.toggle('collapsed');
-            }
-        });
+        // Keyboard shortcuts are handled by the engine (_bindInput)
+        // so they're always global and view-independent.
 
         // Test mode fallback (generates random data, no server)
         document.getElementById('test-mode').addEventListener('click', () => {

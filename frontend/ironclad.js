@@ -1,8 +1,12 @@
 /**
- * IRONCLAD ENGINE v0.7 — Server-Connected Build
+ * IRONCLAD ENGINE v0.8 — Server-Connected Build
  *
  * Canvas/DOM hybrid renderer for time tracking on software-rendered CloudPCs.
  * No dependencies. No build step.
+ *
+ * v0.8: Monthly view (Alt-M). Epoch-date model (Task.date u16). All keyboard
+ *        shortcuts consolidated into the engine — global, view-independent.
+ *        SoA now stores dates[] for monthly day-cell lookup.
  *
  * v0.7: Alt+drag to clone tasks. SoA now stores raw priority and service UUID
  *        per entity so clones carry full metadata. _sendCreateTask accepts
@@ -1022,17 +1026,27 @@ class IroncladEngine {
             this._sendCreateTask(this._weekStart() + col, startTime, 30);
         });
 
+        // ── Global keyboard shortcuts ─────────────────────────────────
+        // All keybinds live here. None are conditional on view state —
+        // they work from wherever you are and take you where you want to go.
         document.addEventListener('keydown', (e) => {
-            if (e.altKey && e.key === 'm') {
+            if (!e.altKey) return;
+            const key = e.key.toLowerCase();
+
+            if (key === 'm') {
+                // Alt-M: toggle monthly view
                 e.preventDefault();
                 this.viewMode = this.viewMode === 'month' ? 'week' : 'month';
                 if (this.viewMode === 'month') {
-                    // Month view is read-only — hide all hover proxies
                     for (let i = 0; i < this.pool.length; i++) this.pool[i].style.display = 'none';
                 } else {
-                    this.prevMX = -9999; // force flashlight refresh
+                    this.prevMX = -9999; // force flashlight refresh on return to week
                 }
                 this.dirty = true;
+            } else if (key === 'c') {
+                // Alt-C: Quake/Yakuake-style calendar collapse — slide from left
+                e.preventDefault();
+                this.container.classList.toggle('collapsed');
             }
         });
 
