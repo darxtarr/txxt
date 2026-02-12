@@ -44,13 +44,17 @@ impl SaveFile {
         let mut world = World::new();
         let txn = self.db.begin_read()?;
 
-        // Load tasks
+        // Load tasks — skip tasks that fail to decode (e.g. old format with u8 day field)
+        // and warn rather than hard-failing boot, to ease migration.
         let tasks_table = txn.open_table(WORLD_TASKS)?;
         for entry in tasks_table.iter()? {
             let (_, value) = entry?;
-            let task: Task = postcard::from_bytes(value.value())
-                .map_err(|e| SaveFileError::Decode(e.to_string()))?;
-            world.tasks.insert(task.id, task);
+            match postcard::from_bytes::<Task>(value.value()) {
+                Ok(task) => { world.tasks.insert(task.id, task); }
+                Err(e) => {
+                    eprintln!("[persist] skipping undecodable task record (format migration?): {e}");
+                }
+            }
         }
 
         // Load users
@@ -314,6 +318,9 @@ mod tests {
         let svc_id = *world.services.keys().next().unwrap();
         let user_id = Uuid::nil();
 
+        // 2026-02-11 = epoch day 20495
+        const D: u16 = 20495;
+
         // Create a task
         let event = world.apply(
             Command::CreateTask {
@@ -321,7 +328,7 @@ mod tests {
                 service_id: svc_id,
                 priority: Priority::High,
                 assigned_to: None,
-                day: None,
+                date: None,
                 start_time: None,
                 duration: None,
             },
@@ -338,7 +345,7 @@ mod tests {
         let event = world.apply(
             Command::ScheduleTask {
                 task_id,
-                day: 2,
+                date: D,
                 start_time: 540,
                 duration: 60,
             },
@@ -354,7 +361,7 @@ mod tests {
         let task = &world2.tasks[&task_id];
         assert_eq!(task.title, "Test task");
         assert_eq!(task.status, crate::world::TaskStatus::Scheduled);
-        assert_eq!(task.day, Some(2));
+        assert_eq!(task.date, Some(D));
         assert_eq!(task.start_time, Some(540));
         assert_eq!(task.duration, Some(60));
 
@@ -376,7 +383,7 @@ mod tests {
                 service_id: svc_id,
                 priority: Priority::Low,
                 assigned_to: None,
-                day: None,
+                date: None,
                 start_time: None,
                 duration: None,
             },

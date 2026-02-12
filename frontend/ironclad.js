@@ -105,7 +105,7 @@ const WIRE = {
     TASK_ID:          0,   // 16 bytes UUID
     TASK_STATUS:      16,  // u8
     TASK_PRIORITY:    17,  // u8
-    TASK_DAY:         18,  // u8 (0xFF = staged)
+    TASK_DATE:        18,  // u16 LE epoch days since 1970-01-01 (0xFFFF = staged)
     TASK_START_TIME:  20,  // u16 LE
     TASK_DURATION:    22,  // u16 LE
     TASK_SERVICE_ID:  24,  // 16 bytes UUID
@@ -297,10 +297,10 @@ class IroncladEngine {
         for (let t = 0; t < taskCount; t++) {
             const off = base + t * WIRE.TASK_STRIDE;
             const status = view.getUint8(off + WIRE.TASK_STATUS);
-            const day = view.getUint8(off + WIRE.TASK_DAY);
+            const date = view.getUint16(off + WIRE.TASK_DATE, true);
 
-            // Skip staged (day=0xFF) and completed tasks
-            if (day === 0xFF || status === 3) continue;
+            // Skip staged (date=0xFFFF) and completed tasks
+            if (date === 0xFFFF || status === 3) continue;
 
             this._loadTaskRecord(view, buffer, off, idx);
             idx++;
@@ -325,7 +325,7 @@ class IroncladEngine {
     // ── Load one task record into SoA slot ──────────────────────────
 
     _loadTaskRecord(view, buffer, off, idx) {
-        const day       = view.getUint8(off + WIRE.TASK_DAY);
+        const date      = view.getUint16(off + WIRE.TASK_DATE, true);
         const startTime = view.getUint16(off + WIRE.TASK_START_TIME, true);
         const duration  = view.getUint16(off + WIRE.TASK_DURATION, true);
         const priority  = view.getUint8(off + WIRE.TASK_PRIORITY);
@@ -336,10 +336,13 @@ class IroncladEngine {
         this.serviceIds.set(new Uint8Array(buffer, off + WIRE.TASK_SERVICE_ID, 16), uuidOff);
         this.priorities[idx] = priority;
 
+        // Derive column (0=Mon..6=Sun) from epoch days: Jan 1 1970 = Thursday = day 3
+        const col = (date + 3) % 7;
+
         // Convert scheduling data to pixel coordinates
         const pad = 10;
         this.ids[idx]  = idx;
-        this.xs[idx]   = CONFIG.LEFT_GUTTER + day * CONFIG.DAY_WIDTH + pad;
+        this.xs[idx]   = CONFIG.LEFT_GUTTER + col * CONFIG.DAY_WIDTH + pad;
         this.ys[idx]   = CONFIG.TOP_HEADER + ((startTime / 60) - CONFIG.START_HOUR) * CONFIG.HOUR_HEIGHT;
         this.ws[idx]   = CONFIG.DAY_WIDTH - pad * 2;
         this.hs[idx]   = (duration / 60) * CONFIG.HOUR_HEIGHT;
@@ -363,10 +366,10 @@ class IroncladEngine {
         // Task record starts at offset 9 (after type + revision)
         const off = 9;
         const status = view.getUint8(off + WIRE.TASK_STATUS);
-        const day = view.getUint8(off + WIRE.TASK_DAY);
+        const date = view.getUint16(off + WIRE.TASK_DATE, true);
 
         // Only add to grid if scheduled
-        if (day === 0xFF || status === 3) return;
+        if (date === 0xFFFF || status === 3) return;
 
         const idx = this.count;
         this._loadTaskRecord(view, buffer, off, idx);
@@ -384,9 +387,10 @@ class IroncladEngine {
         const uuidBytes = new Uint8Array(view.buffer, view.byteOffset + 9, 16);
         const idx = this._findByUuid(uuidBytes);
 
-        const day       = view.getUint8(25);
-        const startTime = view.getUint16(26, true);
-        const duration  = view.getUint16(28, true);
+        const date      = view.getUint16(25, true);  // [25..27]
+        const startTime = view.getUint16(27, true);  // [27..29]
+        const duration  = view.getUint16(29, true);  // [29..31]
+        const col       = (date + 3) % 7;            // epoch days → column (0=Mon..6=Sun)
 
         if (idx === -1) {
             // Task was staged, now scheduled — need to add it
@@ -395,7 +399,7 @@ class IroncladEngine {
             const pad = 10;
             this.uuids.set(uuidBytes, newIdx * 16);
             this.ids[newIdx]  = newIdx;
-            this.xs[newIdx]   = CONFIG.LEFT_GUTTER + day * CONFIG.DAY_WIDTH + pad;
+            this.xs[newIdx]   = CONFIG.LEFT_GUTTER + col * CONFIG.DAY_WIDTH + pad;
             this.ys[newIdx]   = CONFIG.TOP_HEADER + ((startTime / 60) - CONFIG.START_HOUR) * CONFIG.HOUR_HEIGHT;
             this.ws[newIdx]   = CONFIG.DAY_WIDTH - pad * 2;
             this.hs[newIdx]   = (duration / 60) * CONFIG.HOUR_HEIGHT;
@@ -404,7 +408,7 @@ class IroncladEngine {
             this.count++;
         } else {
             const pad = 10;
-            this.xs[idx] = CONFIG.LEFT_GUTTER + day * CONFIG.DAY_WIDTH + pad;
+            this.xs[idx] = CONFIG.LEFT_GUTTER + col * CONFIG.DAY_WIDTH + pad;
             this.ys[idx] = CONFIG.TOP_HEADER + ((startTime / 60) - CONFIG.START_HOUR) * CONFIG.HOUR_HEIGHT;
             this.hs[idx] = (duration / 60) * CONFIG.HOUR_HEIGHT;
         }
@@ -450,7 +454,8 @@ class IroncladEngine {
 
         // Convert pixel position back to scheduling data
         const col = Math.round((this.xs[entityIdx] - CONFIG.LEFT_GUTTER - 10) / CONFIG.DAY_WIDTH);
-        const day = Math.max(0, Math.min(col, CONFIG.DAYS - 1));
+        const clampedCol = Math.max(0, Math.min(col, CONFIG.DAYS - 1));
+        const date = this._weekStart() + clampedCol; // epoch days
 
         const relMinutes = ((this.ys[entityIdx] - CONFIG.TOP_HEADER) / CONFIG.HOUR_HEIGHT + CONFIG.START_HOUR) * 60;
         const startTime = Math.round(relMinutes / 15) * 15;
@@ -458,16 +463,16 @@ class IroncladEngine {
         const relDur = (this.hs[entityIdx] / CONFIG.HOUR_HEIGHT) * 60;
         const duration = Math.max(15, Math.round(relDur / 15) * 15);
 
-        // Pack: [type:u8][task_id:16][day:u8][start_time:u16 LE][duration:u16 LE]
-        const buf = new ArrayBuffer(22);
+        // Pack: [type:u8][task_id:16][date:u16 LE][start_time:u16 LE][duration:u16 LE]
+        const buf = new ArrayBuffer(23);
         const v = new DataView(buf);
         const arr = new Uint8Array(buf);
 
         arr[0] = WIRE.CMD_MOVE_TASK;
         arr.set(this.uuids.subarray(entityIdx * 16, entityIdx * 16 + 16), 1);
-        arr[17] = day;
-        v.setUint16(18, startTime, true);
-        v.setUint16(20, duration, true);
+        v.setUint16(17, date, true);
+        v.setUint16(19, startTime, true);
+        v.setUint16(21, duration, true);
 
         this.ws_conn.send(buf);
     }
@@ -476,7 +481,8 @@ class IroncladEngine {
 
     // title/priority/serviceId are optional — used when cloning an existing task.
     // Defaults: 'New task', Medium priority, defaultServiceId.
-    _sendCreateTask(day, startTime, duration, title, priority, serviceId) {
+    // date is epoch days (u16); use 0xFFFF for staged, or _weekStart()+col for grid.
+    _sendCreateTask(date, startTime, duration, title, priority, serviceId) {
         if (!this.ws_conn || this.ws_conn.readyState !== WebSocket.OPEN) return;
         if (!this.defaultServiceId) return;
 
@@ -486,7 +492,7 @@ class IroncladEngine {
 
         const titleBytes = new TextEncoder().encode(titleStr);
 
-        // Pack: [type:u8][priority:u8][service_id:16][assigned_to:16][day:u8][pad:u8][start:u16][dur:u16][title...]
+        // Pack: [type:u8][priority:u8][service_id:16][assigned_to:16][date:u16 LE][start:u16][dur:u16][title...]
         const buf = new ArrayBuffer(40 + titleBytes.length);
         const v = new DataView(buf);
         const arr = new Uint8Array(buf);
@@ -495,8 +501,7 @@ class IroncladEngine {
         arr[1] = prio;
         arr.set(svcId, 2);                        // service_id at [2..18]
         // assigned_to at [18..34] stays zeroed (none)
-        arr[34] = day;                            // day
-        arr[35] = 0;                              // pad
+        v.setUint16(34, date, true);              // date (u16 LE epoch days, 0xFFFF = staged)
         v.setUint16(36, startTime, true);         // start_time
         v.setUint16(38, duration, true);          // duration
         arr.set(titleBytes, 40);                  // title
@@ -505,6 +510,14 @@ class IroncladEngine {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────
+
+    // Returns epoch days (UTC, since 1970-01-01) for the Monday of the current week.
+    // Used to convert grid columns (0=Mon..6=Sun) to absolute epoch dates.
+    _weekStart() {
+        const utcDayOfWeek = (new Date().getUTCDay() + 6) % 7; // 0=Mon..6=Sun
+        const utcEpochDays = Math.floor(Date.now() / 86400000);
+        return utcEpochDays - utcDayOfWeek;
+    }
 
     _findByUuid(uuidBytes) {
         for (let i = 0; i < this.count; i++) {
@@ -841,7 +854,7 @@ class IroncladEngine {
             // Clamp: don't go past end of visible grid
             if (startTime < CONFIG.START_HOUR * 60 || startTime + 30 > CONFIG.END_HOUR * 60) return;
 
-            this._sendCreateTask(col, startTime, 30);
+            this._sendCreateTask(this._weekStart() + col, startTime, 30);
         });
 
         this.container.addEventListener('mousedown', (e) => {
@@ -899,7 +912,8 @@ class IroncladEngine {
                     const title     = this.labels[i][0];
                     const priority  = this.priorities[i];
                     const serviceId = this.serviceIds.subarray(i * 16, i * 16 + 16);
-                    this._sendCreateTask(day, startTime, duration, title, priority, serviceId);
+                    const date      = this._weekStart() + day;
+                    this._sendCreateTask(date, startTime, duration, title, priority, serviceId);
                 }
 
                 // Restore original to where it was — server will add the clone separately
