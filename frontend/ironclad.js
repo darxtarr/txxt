@@ -136,9 +136,13 @@ class IroncladEngine {
         this.hs         = new Float32Array(CONFIG.MAX_ENTITIES);
         this.types      = new Uint8Array(CONFIG.MAX_ENTITIES);
         this.priorities = new Uint8Array(CONFIG.MAX_ENTITIES);          // raw priority 0-3
+        this.dates      = new Uint16Array(CONFIG.MAX_ENTITIES);         // epoch days (0xFFFF = staged)
         this.labels     = new Array(CONFIG.MAX_ENTITIES);               // strings can't live in typed arrays
         this.uuids      = new Uint8Array(CONFIG.MAX_ENTITIES * 16);     // 16-byte UUIDs, flat
         this.serviceIds = new Uint8Array(CONFIG.MAX_ENTITIES * 16);     // 16-byte service UUIDs, flat
+
+        // ── View state ──
+        this.viewMode = 'week'; // 'week' | 'month'
 
         // ── Server connection state ──
         this.ws_conn = null;
@@ -339,6 +343,9 @@ class IroncladEngine {
         // Derive column (0=Mon..6=Sun) from epoch days: Jan 1 1970 = Thursday = day 3
         const col = (date + 3) % 7;
 
+        // Store raw epoch date for monthly view
+        this.dates[idx] = date;
+
         // Convert scheduling data to pixel coordinates
         const pad = 10;
         this.ids[idx]  = idx;
@@ -398,16 +405,18 @@ class IroncladEngine {
             const newIdx = this.count;
             const pad = 10;
             this.uuids.set(uuidBytes, newIdx * 16);
-            this.ids[newIdx]  = newIdx;
-            this.xs[newIdx]   = CONFIG.LEFT_GUTTER + col * CONFIG.DAY_WIDTH + pad;
-            this.ys[newIdx]   = CONFIG.TOP_HEADER + ((startTime / 60) - CONFIG.START_HOUR) * CONFIG.HOUR_HEIGHT;
-            this.ws[newIdx]   = CONFIG.DAY_WIDTH - pad * 2;
-            this.hs[newIdx]   = (duration / 60) * CONFIG.HOUR_HEIGHT;
+            this.ids[newIdx]   = newIdx;
+            this.dates[newIdx] = date;
+            this.xs[newIdx]    = CONFIG.LEFT_GUTTER + col * CONFIG.DAY_WIDTH + pad;
+            this.ys[newIdx]    = CONFIG.TOP_HEADER + ((startTime / 60) - CONFIG.START_HOUR) * CONFIG.HOUR_HEIGHT;
+            this.ws[newIdx]    = CONFIG.DAY_WIDTH - pad * 2;
+            this.hs[newIdx]    = (duration / 60) * CONFIG.HOUR_HEIGHT;
             this.types[newIdx] = 0;
             this.labels[newIdx] = ['(new task)', '', '', '', ''];
             this.count++;
         } else {
             const pad = 10;
+            this.dates[idx] = date;
             this.xs[idx] = CONFIG.LEFT_GUTTER + col * CONFIG.DAY_WIDTH + pad;
             this.ys[idx] = CONFIG.TOP_HEADER + ((startTime / 60) - CONFIG.START_HOUR) * CONFIG.HOUR_HEIGHT;
             this.hs[idx] = (duration / 60) * CONFIG.HOUR_HEIGHT;
@@ -542,6 +551,7 @@ class IroncladEngine {
             this.hs[idx]         = this.hs[last];
             this.types[idx]      = this.types[last];
             this.priorities[idx] = this.priorities[last];
+            this.dates[idx]      = this.dates[last];
             this.labels[idx]     = this.labels[last];
             this.uuids.copyWithin(idx * 16, last * 16, last * 16 + 16);
             this.serviceIds.copyWithin(idx * 16, last * 16, last * 16 + 16);
@@ -591,13 +601,17 @@ class IroncladEngine {
 
         const moved = this.mouseX !== this.prevMX || this.mouseY !== this.prevMY;
         if (moved || this.dragIdx >= 0) {
-            this._flashlight();
+            if (this.viewMode === 'week') this._flashlight();
             this.prevMX = this.mouseX;
             this.prevMY = this.mouseY;
         }
 
         if (this.dirty) {
-            this._render();
+            if (this.viewMode === 'month') {
+                this._renderMonth();
+            } else {
+                this._render();
+            }
             this.dirty = false;
         }
 
@@ -679,6 +693,157 @@ class IroncladEngine {
                 if (p.style.display !== 'none') p.style.display = 'none';
             }
         }
+    }
+
+    // ── Monthly calendar render (Alt-M, read-only) ─────────────────────
+
+    _renderMonth() {
+        const W = this.canvas.width;
+        const H = this.canvas.height;
+        const ctx = this.ctx;
+        const dpr = this.dpr;
+
+        ctx.fillStyle = '#0a0a0e';
+        ctx.fillRect(0, 0, W, H);
+        ctx.save();
+        ctx.scale(dpr, dpr);
+
+        const lw = W / dpr;
+        const lh = H / dpr;
+
+        // ── Month bounds ──────────────────────────────────────────────────
+        const today     = Math.floor(Date.now() / 86400000); // UTC epoch days
+        const todayDate = new Date(today * 86400000);
+        const year      = todayDate.getUTCFullYear();
+        const month     = todayDate.getUTCMonth(); // 0-indexed
+
+        const firstDay = Math.floor(Date.UTC(year, month, 1)     / 86400000);
+        const lastDay  = Math.floor(Date.UTC(year, month + 1, 0) / 86400000);
+
+        // Grid starts on the Monday of the week containing firstDay
+        const firstDow  = (firstDay + 3) % 7; // 0=Mon..6=Sun
+        const gridStart = firstDay - firstDow;
+
+        // Grid ends on the Sunday of the week containing lastDay
+        const lastDow = (lastDay + 3) % 7;
+        const gridEnd = lastDay + (6 - lastDow);
+
+        const numWeeks = (gridEnd - gridStart + 1) / 7;
+
+        // ── Layout ────────────────────────────────────────────────────────
+        const TITLE_H  = 30;
+        const LABEL_H  = 22;
+        const HEADER_H = TITLE_H + LABEL_H;
+        const cellW    = lw / 7;
+        const cellH    = (lh - HEADER_H) / numWeeks;
+        const CELL_PAD = 4;
+        const BAR_H    = 14;
+        const BAR_GAP  = 2;
+        const maxBars  = Math.max(1, Math.floor((cellH - 22) / (BAR_H + BAR_GAP)));
+
+        const MONTH_NAMES = ['January','February','March','April','May','June',
+                             'July','August','September','October','November','December'];
+
+        // ── Month title ───────────────────────────────────────────────────
+        ctx.fillStyle   = '#00ffcc';
+        ctx.font        = '700 13px monospace';
+        ctx.textAlign   = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(MONTH_NAMES[month].toUpperCase() + ' ' + year, lw / 2, TITLE_H / 2);
+
+        // ── Day-of-week labels ────────────────────────────────────────────
+        ctx.fillStyle = '#555';
+        ctx.font      = '600 11px monospace';
+        for (let d = 0; d < 7; d++) {
+            ctx.fillText(DAY_LABELS[d], d * cellW + cellW / 2, TITLE_H + LABEL_H / 2);
+        }
+
+        // ── Build per-day task lookup ─────────────────────────────────────
+        const tasksByDay = new Map();
+        for (let i = 0; i < this.count; i++) {
+            const d = this.dates[i];
+            if (d === 0xFFFF) continue;
+            if (!tasksByDay.has(d)) tasksByDay.set(d, []);
+            tasksByDay.get(d).push(i);
+        }
+
+        // ── Draw grid cells ───────────────────────────────────────────────
+        ctx.textBaseline = 'top';
+
+        for (let w = 0; w < numWeeks; w++) {
+            for (let d = 0; d < 7; d++) {
+                const epochDay = gridStart + w * 7 + d;
+                const cx = d * cellW;
+                const cy = HEADER_H + w * cellH;
+                const inMonth = epochDay >= firstDay && epochDay <= lastDay;
+                const isToday = epochDay === today;
+
+                // Background
+                ctx.fillStyle = inMonth ? '#0e0e16' : '#0a0a0e';
+                ctx.fillRect(cx, cy, cellW, cellH);
+                if (isToday) {
+                    ctx.fillStyle = 'rgba(0,255,204,0.05)';
+                    ctx.fillRect(cx, cy, cellW, cellH);
+                }
+
+                // Cell border
+                ctx.strokeStyle = isToday ? '#1e3a3a' : '#16161e';
+                ctx.lineWidth = 1;
+                ctx.strokeRect(cx + 0.5, cy + 0.5, cellW - 1, cellH - 1);
+
+                // Day number
+                const dayNum = new Date(epochDay * 86400000).getUTCDate();
+                ctx.font      = isToday ? '700 11px monospace' : '11px monospace';
+                ctx.fillStyle = isToday ? '#00ffcc' : inMonth ? '#555' : '#2a2a35';
+                ctx.textAlign = 'right';
+                ctx.fillText(String(dayNum), cx + cellW - CELL_PAD, cy + CELL_PAD);
+
+                // Task bars
+                const tasks = tasksByDay.get(epochDay);
+                if (!tasks) continue;
+
+                let barY = cy + 20;
+                for (let t = 0; t < Math.min(tasks.length, maxBars); t++) {
+                    // Overflow indicator on last visible slot
+                    if (t === maxBars - 1 && tasks.length > maxBars) {
+                        ctx.fillStyle   = '#444';
+                        ctx.font        = '10px monospace';
+                        ctx.textAlign   = 'left';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillText('+' + (tasks.length - maxBars + 1) + ' more', cx + CELL_PAD, barY + BAR_H / 2);
+                        ctx.textBaseline = 'top';
+                        break;
+                    }
+
+                    const ti   = tasks[t];
+                    const type = this.types[ti];
+                    const barX = cx + CELL_PAD;
+                    const barW = cellW - CELL_PAD * 2;
+
+                    ctx.fillStyle   = TYPE_COLORS[type][0];
+                    ctx.fillRect(barX, barY, barW, BAR_H);
+                    ctx.strokeStyle = TYPE_COLORS[type][1];
+                    ctx.lineWidth   = 1;
+                    ctx.strokeRect(barX + 0.5, barY + 0.5, barW - 1, BAR_H - 1);
+
+                    // Title — clipped to bar
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(barX + 2, barY, barW - 4, BAR_H);
+                    ctx.clip();
+                    ctx.fillStyle   = '#ccc';
+                    ctx.font        = '10px -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif';
+                    ctx.textAlign   = 'left';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(this.labels[ti][0], barX + 3, barY + BAR_H / 2);
+                    ctx.restore();
+
+                    barY += BAR_H + BAR_GAP;
+                }
+            }
+        }
+
+        ctx.restore();
     }
 
     // ── Canvas render ───────────────────────────────────────────────────
@@ -855,6 +1020,20 @@ class IroncladEngine {
             if (startTime < CONFIG.START_HOUR * 60 || startTime + 30 > CONFIG.END_HOUR * 60) return;
 
             this._sendCreateTask(this._weekStart() + col, startTime, 30);
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.altKey && e.key === 'm') {
+                e.preventDefault();
+                this.viewMode = this.viewMode === 'month' ? 'week' : 'month';
+                if (this.viewMode === 'month') {
+                    // Month view is read-only — hide all hover proxies
+                    for (let i = 0; i < this.pool.length; i++) this.pool[i].style.display = 'none';
+                } else {
+                    this.prevMX = -9999; // force flashlight refresh
+                }
+                this.dirty = true;
+            }
         });
 
         this.container.addEventListener('mousedown', (e) => {

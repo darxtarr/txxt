@@ -136,8 +136,7 @@ byte layout. JSON is never used in the data path.
 [0..16]    id (UUID, 16 bytes)
 [16]       status (u8: 0=Staged, 1=Scheduled, 2=Active, 3=Completed)
 [17]       priority (u8: 0=Low, 1=Medium, 2=High, 3=Urgent)
-[18]       day (u8: 0-6 Mon-Sun, 0xFF = not scheduled)
-[19]       _pad
+[18..20]   date (u16 LE, epoch days since 1970-01-01, 0xFFFF = not scheduled)
 [20..22]   start_time (u16 LE, minutes from midnight, 15-min grid)
 [22..24]   duration (u16 LE, minutes, 15-min grid)
 [24..40]   service_id (UUID, 16 bytes)
@@ -145,6 +144,9 @@ byte layout. JSON is never used in the data path.
 [56..184]  title (128 bytes, UTF-8, zero-padded)
 [184..192] _reserved
 ```
+
+Day-of-week is derived from epoch days: `(date + 3) % 7` gives 0=Mon..6=Sun
+(Jan 1 1970 = Thursday = day 3 in 0=Mon numbering).
 
 ### Service record (80 bytes, fixed stride)
 
@@ -158,7 +160,7 @@ byte layout. JSON is never used in the data path.
 First byte is message type:
 - `0x01` Snapshot: `[type][rev:u64][task_count:u32][svc_count:u32][tasks...][services...]`
 - `0x02` TaskCreated: `[type][rev:u64][task_record:192]`
-- `0x03` TaskScheduled: `[type][rev:u64][task_id:16][day:u8][start:u16][dur:u16]`
+- `0x03` TaskScheduled: `[type][rev:u64][task_id:16][date:u16][start:u16][dur:u16]`
 - `0x04` TaskMoved: same layout as TaskScheduled
 - `0x05` TaskUnscheduled: `[type][rev:u64][task_id:16]`
 - `0x06` TaskCompleted: `[type][rev:u64][task_id:16]`
@@ -166,8 +168,8 @@ First byte is message type:
 
 ### Client → Server commands
 
-- `0x10` CreateTask: `[type][priority:u8][service_id:16][assigned_to:16][title:UTF-8...]`
-- `0x11` ScheduleTask: `[type][task_id:16][day:u8][start:u16][dur:u16]`
+- `0x10` CreateTask: `[type][priority:u8][service_id:16][assigned_to:16][date:u16][start:u16][dur:u16][title:UTF-8...]`
+- `0x11` ScheduleTask: `[type][task_id:16][date:u16][start:u16][dur:u16]`
 - `0x12` MoveTask: same layout as ScheduleTask
 - `0x13` UnscheduleTask: `[type][task_id:16]`
 - `0x14` CompleteTask: `[type][task_id:16]`
@@ -182,9 +184,10 @@ const TASK_STRIDE = 192;
 const taskOffset = 17 + (i * TASK_STRIDE);
 const status    = view.getUint8(taskOffset + 16);
 const priority  = view.getUint8(taskOffset + 17);
-const day       = view.getUint8(taskOffset + 18);
-const startTime = view.getUint16(taskOffset + 20, true);  // LE
-const duration  = view.getUint16(taskOffset + 22, true);  // LE
+const date      = view.getUint16(taskOffset + 18, true); // epoch days, 0xFFFF = staged
+const startTime = view.getUint16(taskOffset + 20, true); // LE
+const duration  = view.getUint16(taskOffset + 22, true); // LE
+const col       = (date + 3) % 7;                        // 0=Mon..6=Sun
 ```
 
 ### Sync semantics
@@ -206,7 +209,7 @@ Core identity:
 - id, title, service_id, created_by
 
 Scheduling (what IRONCLAD renders on the grid):
-- day (0-6, Mon-Sun)
+- date (u16 epoch days since 1970-01-01; 0xFFFF = staged/unscheduled)
 - start_time (minutes from midnight, snapped to 15-min grid)
 - duration (minutes, snapped to 15-min grid)
 - assigned_to (who owns this time slot)

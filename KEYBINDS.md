@@ -5,7 +5,7 @@
 | Key | Action |
 |-----|--------|
 | Alt-C | Toggle calendar collapse — slides from left to single column (today) |
-| Alt-M | Toggle monthly view *(planned)* |
+| Alt-M | Toggle monthly view — full-month grid, read-only |
 
 ## Reserved by browser — avoid these
 
