@@ -1,6 +1,7 @@
 mod auth;
 mod game;
 mod persist;
+mod renderer;
 mod wire;
 mod world;
 

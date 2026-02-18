@@ -13,3 +13,4 @@ backend/target/
 
 # Tool scratch
 .opencode/tmp/**
+.tmp/

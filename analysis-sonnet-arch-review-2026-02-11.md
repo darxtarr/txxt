@@ -17,7 +17,7 @@
 │  - Canvas/DOM hybrid renderer                                │
 │  - Binary WebSocket consumer                                 │
 │  - Drag-drop, SoA entity storage, spatial bucketing          │
-│  - Zero deps, 878 lines of handwritten JS                    │
+│  - Zero deps, ~1230 lines of handwritten JS                    │
 └─────────────────────────────────────────────────────────────┘
               ↕ Binary frames (fixed-stride packed records)
 ┌─────────────────────────────────────────────────────────────┐
@@ -43,12 +43,12 @@
 
 ### Core Modules (~2000 lines, 33 passing unit tests)
 
-#### **world.rs** (750 lines, 19 tests) — The State Machine
+#### **world.rs** (~780 lines, 19+ tests) — The State Machine
 
 Pure, deterministic state machine with zero I/O.
 
 **Key Types:**
-- **Task**: id, title, status (Staged→Scheduled→Active→Completed), priority (Low/Medium/High/Urgent), service_id, created_by, assigned_to, day (0-6), start_time (u16 mins), duration (u16 mins)
+- **Task**: id, title, status (Staged→Scheduled→Active→Completed), priority (Low/Medium/High/Urgent), service_id, created_by, assigned_to, date (u16 epoch days since 1970-01-01, None if Staged), start_time (u16 mins, None if Staged), duration (u16 mins, None if Staged)
 - **Command**: Enum with variants CreateTask, ScheduleTask, MoveTask, UnscheduleTask, CompleteTask, DeleteTask
 - **Event**: Enum with TaskCreated, TaskScheduled, TaskMoved, etc. — these are broadcast to all clients
 - **World**: HashMap-based entity storage + u64 revision counter + Vec event log
@@ -58,7 +58,7 @@ Pure, deterministic state machine with zero I/O.
 pub fn apply(&mut self, cmd: Command, user_id: Uuid) -> Result<Event, WorldError>
 ```
 Every command:
-1. Validates against business rules (day 0-6, time on 15-min grid, duration ≥ 15 mins)
+1. Validates against business rules (date ≠ 0xFFFF, time on 15-min grid, duration ≥ 15 mins)
 2. Mutates state in memory
 3. Increments revision counter
 4. Appends to event log
@@ -72,12 +72,12 @@ Every command:
 - Scheduled/Active → Staged (via UnscheduleTask)
 
 **Validation Helpers:**
-- `validate_scheduling(day, start_time, duration)` — enforces day 0-6, time mod 15 = 0, duration > 0 and not past midnight
+- `validate_scheduling(date, start_time, duration)` — rejects date 0xFFFF, enforces time mod 15 = 0, duration > 0 and not past midnight
 
 **Tests Cover:**
 - Task creation (starts Staged)
 - State transition rules (can't double-schedule, can't move Staged tasks)
-- Scheduling validation (day/time/duration bounds)
+- Scheduling validation (date/time/duration bounds)
 - Event log and revision counter
 - Staging queue (returns Staged tasks sorted by priority)
 - Reconnect replay via `events_since(rev)`
@@ -95,8 +95,7 @@ Hand-rolled fixed-stride packed binary, readable by JS DataView at known offsets
 [0..16]    id (UUID)
 [16]       status (u8: 0=Staged, 1=Scheduled, 2=Active, 3=Completed)
 [17]       priority (u8: 0=Low, 1=Medium, 2=High, 3=Urgent)
-[18]       day (u8: 0-6 Mon-Sun, 0xFF = not scheduled / staged)
-[19]       _pad
+[18..20]   date (u16 LE, epoch days since 1970-01-01, 0xFFFF = not scheduled)
 [20..22]   start_time (u16 LE, minutes from midnight)
 [22..24]   duration (u16 LE, minutes)
 [24..40]   service_id (UUID)
@@ -104,6 +103,8 @@ Hand-rolled fixed-stride packed binary, readable by JS DataView at known offsets
 [56..184]  title (128 bytes UTF-8 zero-padded)
 [184..192] _reserved
 ```
+
+Day-of-week is derived: `(date + 3) % 7` → 0=Mon .. 6=Sun (Jan 1 1970 = Thursday = 3 in 0=Mon numbering).
 
 **Service Record (80 bytes fixed stride):**
 ```
@@ -114,7 +115,7 @@ Hand-rolled fixed-stride packed binary, readable by JS DataView at known offsets
 **Server → Client Messages:**
 - `0x01` Snapshot: full state dump at startup
 - `0x02` TaskCreated: new task (includes full 192-byte task record)
-- `0x03` TaskScheduled: task scheduled (day, start, duration)
+- `0x03` TaskScheduled: task scheduled (date, start, duration)
 - `0x04` TaskMoved: task moved (same fields as Scheduled)
 - `0x05` TaskUnscheduled: task removed from grid
 - `0x06` TaskCompleted: task marked done
@@ -123,8 +124,8 @@ Hand-rolled fixed-stride packed binary, readable by JS DataView at known offsets
 All events include revision counter (u64 LE at offset 1) for sync arbitration.
 
 **Client → Server Commands:**
-- `0x10` CreateTask: [type][priority][service_id][assigned_to][day][pad][start u16][dur u16][title]
-- `0x11` ScheduleTask: [type][task_id][day][start][duration]
+- `0x10` CreateTask: [type][priority:u8][service_id:16][assigned_to:16][date:u16][start:u16][dur:u16][title]
+- `0x11` ScheduleTask: [type][task_id:16][date:u16][start:u16][dur:u16]
 - `0x12` MoveTask: same as ScheduleTask
 - `0x13` UnscheduleTask: [type][task_id]
 - `0x14` CompleteTask: [type][task_id]
@@ -316,7 +317,7 @@ const WIRE = {
 | Drag to move | DONE |
 | Double-click to create | DONE |
 | Drag to resize (top + bottom edge) | DONE |
-| Alt+drag to clone | NEXT |
+| Alt+drag to clone | DONE |
 | Modifier-click manual entry | DEFERRED |
 | Multi-day tasks | DEFERRED |
 | Recurring tasks | DEFERRED |

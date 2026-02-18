@@ -1,134 +1,311 @@
 # txxt — Design Document
 
-Updated 2026-02-10. This is the source of truth for architectural decisions.
+Updated 2026-02-18. This is the source of truth for architectural decisions.
 
-## What this is
+---
 
-A Small Multiplayer Online (SMO) scheduling portal for 5-20 ops users on
-enterprise CloudPCs (software-rendered VDI, no GPU). Not a web app. Not
-Google Calendar + Tasks. Think game server + thin client renderer.
+## The Axiom
 
-The goal: stop wasting time filling in Sharepoint text fields. Make scheduling
-and time tracking feel like a Bloomberg terminal — always-on, stateful,
-information-dense, built for people who use it 8 hours a day.
+> **Everything is possible but nothing is real until the click.**
 
-## Mental model: game server, not web API
+This is the load-bearing sentence. Every architectural decision in this project
+derives from it. If you are about to write code that creates a DOM element
+before the user clicks, stop. If you are about to repaint a canvas on mouse
+movement, stop. Read this section again.
 
-This is NOT a REST API with a database and a frontend that makes fetch calls.
-This IS a stateful server that:
+The browser's job is exactly two things:
+1. Display one flat image.
+2. Track the mouse.
 
-- Boots, loads the world into memory
-- Accepts player connections (WebSocket)
-- Receives inputs (commands), validates and applies them to the world state
-- Broadcasts state deltas to all connected players
-- Persists the world to disk (redb) as a save file, not a query engine
+That is all. The browser is a terminal. It does not render. It does not decide.
+It does not own state. It forwards raw events and shows what it is told to show.
 
-The browser is a thin renderer. It sends inputs, receives state, draws pixels.
-It does not own state. It does not make decisions. It does not have a "model
-layer." IRONCLAD is the GPU; the Rust server is the CPU.
+---
 
-## Two repos, one product
-
-### txxt2 (IRONCLAD) — the renderer
-
-Canvas/DOM hybrid. Validated on CloudPC at 32fps (VDI ceiling) with 5000
-entities. Zero dependencies, zero build step.
-
-- Canvas layer: static grid, passive entity rendering, DPR-aware
-- DOM pool: 15 recycled divs, "flashlight" hydrated near cursor (SDF)
-- SoA typed arrays, spatial bucketing, frame-stamp dedup
-- Drag-and-drop with 15-minute grid snap
-- Currently generates random test data — no server connection yet
-
-### txxt (this repo) — the game server
-
-Rust/axum single binary. Authoritative state machine. Owns the world.
-
-## Architecture
+## Topology
 
 ```
-Enterprise systems (ServiceNow, etc.)
-         | Nightly ETL (future)
-         v
-   txxt server (Rust, single binary)
-     - In-memory world state (the runtime truth)
-     - redb (save file, loaded on boot, flushed on mutation)
-     - WebSocket: THE data protocol (binary frames)
-     - REST: auth only (login, maybe health)
-         |
-         | Binary frames (packed structs, DataView on client)
-         v
-   IRONCLAD (browser)
-     - Sends: player commands (move_task, create_task, etc.)
-     - Receives: snapshots + deltas
-     - Renders: Canvas + DOM pool
-     - Owns NOTHING except pixels and input events
+CloudPC (one per user, no GPU, software-rendered VDI)
+┌─────────────────────────────────────────────────────┐
+│  IRONCLAD (browser)                                  │
+│  — displays one flat background image               │
+│  — tracks mouse, forwards raw events                │
+│  — materializes exactly one div on click            │
+│  — dematerializes it on mouseup                     │
+│         ↕ WebSocket (localhost or fast LAN)          │
+│  Rust sidecar (one binary per CloudPC)              │
+│  — owns world state in memory                       │
+│  — renders world to image (software 2D)             │
+│  — runs spatial query, maintains candidate list      │
+│  — knows what is under the cursor at all times      │
+│  — on click: confirms bounds, triggers div          │
+│  — on drop: mutates world, re-renders, sends image  │
+└─────────────────────────────────────────────────────┘
+         ↕ WebSocket (WAN)
+EC2 central server (thin relay, one instance)
+— receives state mutations ("user X moved task Y")
+— broadcasts to all other sidecars
+— persists canonical world state (redb)
+— resyncs sidecars that were offline or crashed
 ```
 
-## Server internals — pseudo-ECS
+The sidecar is the brain. The EC2 is the coordinator. The browser is the glass.
 
-The server thinks in entities and components, not ORM objects.
+**Why one sidecar per CloudPC?**
+CloudPCs have no GPU. All rendering is software on the local CPU. Hit testing,
+spatial queries, image generation — all of this must happen locally to be fast.
+A round trip to EC2 for hit testing would add 20-100ms of latency on every
+click. Unacceptable. The sidecar runs on the same machine as the browser, or
+on the local LAN with sub-millisecond latency.
 
-### World state (in-memory, authoritative)
+**Why a central EC2?**
+Multiple users work the same schedule simultaneously. When user A moves a task,
+users B through F must see it. The EC2 is the single point of broadcast. It
+does not do business logic. It receives mutations and fans them out.
+
+---
+
+## The Interaction Loop
+
+The F1 pit stop model. Everything is pre-positioned. The stop itself is
+instantaneous.
+
+```
+WORLD STATE CHANGES (task moved, created, deleted)
+  Sidecar mutates world state
+  Sidecar re-renders world to image
+  Sidecar sends image over WebSocket
+  Browser sets image as CSS background
+  Browser shows updated world
+  → zero DOM elements. flat image. done.
+
+CURSOR MOVES (continuous, between interactions)
+  Browser forwards cursor coordinates to sidecar
+  Sidecar runs spatial query against world state
+  Sidecar updates candidate list: [task A at (x,y,w,h), task B at ...]
+  Sidecar sends lightweight cursor effect hint to browser
+  Browser draws cheap local glow at cursor position (canvas overlay, tiny)
+  Candidate list is ready. Pit crew in position.
+
+USER CLICKS (the moment of materialization)
+  Browser reports click coordinates to sidecar
+  Sidecar checks candidate list — answer already known, no computation needed
+  Sidecar responds: "task X, bounds (x, y, w, h)"
+  Browser materializes exactly ONE div at exactly those bounds
+  Div appears to "lift" the task out of the background image
+  User interacts with the div (drag, resize, type)
+
+MOUSEUP (dematerialization)
+  Div reports final position to sidecar
+  Sidecar validates, mutates world state
+  Sidecar re-renders world to image
+  Sidecar sends new image
+  Browser swaps background image
+  Browser dematerializes div
+  → zero DOM elements. flat image. pit crew resets.
+```
+
+The background image never changes during an interaction. It is frozen. The
+single div moves above a static backdrop. The VDI codec sees one small moving
+rectangle and a completely static background — near-zero bandwidth.
+
+---
+
+## Input Mode State Machine
+
+The sidecar tracks user input mode. Mode gates what computation runs.
+
+```
+IDLE
+  Spatial queries: throttled (20Hz — humans react at 100-200ms, 60Hz is waste)
+  Canvas overlay: cursor glow only
+  Background: static
+
+HOVER (cursor near candidates)
+  Spatial queries: running, candidate list fresh
+  Canvas overlay: cursor glow, candidate highlight if desired
+  Background: static
+  Pit crew: ready
+
+DRAG (mousedown on materialized div)
+  Spatial queries: SUSPENDED (candidate already known)
+  Background: FROZEN (no repaints)
+  One div: moving via CSS transform
+  Canvas overlay: snap guides if desired, nothing else
+
+RESIZE (mousedown on edge of materialized div)
+  Same as DRAG
+
+TYPING (focus in a text input)
+  Spatial queries: SUSPENDED
+  Background: static
+  No div materialization possible
+
+MONTH_VIEW (Alt-M)
+  Spatial queries: scoped to day-cell hit testing only (simple math, no entity search)
+  Background: month image from sidecar
+  No task div materialization (read-only)
+
+COLLAPSED (Alt-C)
+  Everything suspended
+  Calendar not visible, not computing
+```
+
+Modes are not guessed — they are explicit signals. A keydown starts TYPING.
+A mousedown on a div starts DRAG. Alt-M switches to MONTH_VIEW. The sidecar
+receives these mode signals and gates computation accordingly.
+
+---
+
+## Why This Matters for VDI
+
+VDI codecs (Citrix, RDS, VMware) transmit changed pixels over the network.
+A full canvas repaint every frame = entire screen changed = bandwidth spike =
+codec struggles = visual artifacts on an already-marginal connection.
+
+The background image approach solves this at the application layer:
+
+- Static background = zero codec work between interactions
+- One moving div = one small dirty region (the div's bounding box)
+- Background swap on world change = one deliberate full-frame update at human
+  speed, not 60 chaotic partial updates per second
+
+This stacks with whatever dirty-region optimization the VDI codec itself does.
+The result: the system looks fast on connections where a standard web app
+would visibly lag.
+
+The cursor glow overlay (small canvas element) changes every frame but covers
+a tiny area. VDI codecs handle small dirty regions efficiently.
+
+---
+
+## What IRONCLAD Does (and Does Not Do)
+
+**Does:**
+- Open WebSocket to local sidecar
+- Receive background image → set as CSS `background-image` (blob URL)
+- Track mouse → send cursor coordinates to sidecar at 20Hz
+- Receive candidate list from sidecar → cache it
+- On click → send coordinates to sidecar → receive bounds → materialize one div
+- Drag div → report position updates to sidecar
+- On mouseup → report final position → dematerialize div
+- Draw cursor glow (tiny canvas overlay, local, no sidecar involvement)
+- Handle keybinds → send mode signals to sidecar
+
+**Does not:**
+- Render tasks, grid lines, text, or any world state (sidecar does this)
+- Do hit testing (sidecar does this)
+- Own any world state
+- Create DOM elements except the one active interaction div
+- Run spatial queries
+- Repaint during drag
+
+**IRONCLAD's data model (minimal — just enough for div management):**
+```
+uuids[]       — task UUIDs (to pack commands back to sidecar)
+xs[], ys[]    — candidate positions (for div placement)
+ws[], hs[]    — candidate sizes
+```
+
+No labels. No priorities. No colors. No service IDs. The browser does not
+need rendering data because it does not render.
+
+**Current implementation state:**
+IRONCLAD currently does canvas rendering (world.rs entities → canvas draw calls).
+This was built iteratively and diverged from the intended architecture. The
+canvas code is a correct proof-of-concept but is slated for replacement by
+the sidecar image pipeline. The wire protocol and SoA structure are keepers;
+the rendering code is not.
+
+---
+
+## What the Sidecar Does
+
+The sidecar is the Rust binary that runs locally on each CloudPC. It is the
+authoritative local state machine and the renderer.
+
+**Responsibilities:**
+- Boot: load world state from redb (or sync from EC2 if offline)
+- Accept WebSocket connection from local IRONCLAD
+- Maintain full world state in memory (HashMap<Uuid, Task/User/Service>)
+- Track cursor coordinates (received from browser at 20Hz)
+- Run spatial queries → maintain candidate list
+- Send candidate list updates to browser
+- On click: confirm which task/element, send bounds to browser
+- On drop: validate position, apply mutation, increment revision
+- Re-render world to image after any state change → send to browser
+- Relay mutations to EC2 → receive broadcasts from EC2 → apply deltas
+- Persist world state to local redb (fast local writes)
+
+**Rendering:**
+The sidecar renders the world to a flat image using a software 2D library
+(no GPU required). The image is the authoritative visual representation.
+What the sidecar renders is exactly what the user sees. No client-side
+rendering divergence is possible.
+
+Rendering triggers: task created, task moved, task deleted, task completed,
+week navigation, view mode change. Never on cursor movement.
+
+---
+
+## What the EC2 Does
+
+The EC2 is deliberately thin. It does not run business logic.
+
+**Responsibilities:**
+- Accept WebSocket connections from all sidecars
+- Receive state mutations: `[user_id][event_type][payload]`
+- Broadcast mutations to all other connected sidecars
+- Persist canonical world state to redb
+- On sidecar reconnect: send full snapshot or event log since last_seen_rev
+
+The EC2 is a stateful relay, not a game server. The sidecars do the work.
+The EC2 coordinates and persists.
+
+---
+
+## Data Model
+
+### Task — the unit of work
 
 ```rust
-struct World {
-    // Entity storage — HashMap for now, SoA later if needed
-    tasks: HashMap<Uuid, Task>,
-    users: HashMap<Uuid, User>,
-    services: HashMap<Uuid, Service>,
-
-    // Monotonic revision counter — every mutation increments this
-    revision: u64,
-
-    // Connected players
-    connections: HashMap<ConnectionId, PlayerSession>,
-}
-
-struct PlayerSession {
-    user_id: Uuid,
-    last_seen_rev: u64,
-    // What view they're looking at (which week, which service filter)
-    // So we can send targeted deltas later if needed
+struct Task {
+    id: Uuid,
+    title: String,
+    status: TaskStatus,      // Staged | Scheduled | Active | Completed
+    priority: Priority,      // Low | Medium | High | Urgent
+    service_id: Uuid,
+    created_by: Uuid,
+    assigned_to: Option<Uuid>,
+    date: Option<u16>,       // epoch days since 1970-01-01 (None = Staged)
+    start_time: Option<u16>, // minutes from midnight, 15-min grid (None = Staged)
+    duration: Option<u16>,   // minutes, 15-min grid (None = Staged)
 }
 ```
 
-### Boot sequence
+Day-of-week derived from epoch days: `(date + 3) % 7` → 0=Mon .. 6=Sun.
+The sidecar owns time. Browser never computes week boundaries.
 
-1. Open redb, load all entities into World
-2. Bind port, start accepting connections
-3. Ready (no cold queries ever — everything served from memory)
+### Service — who pays for the time
 
-### Mutation flow (the hot path)
-
-```
-Client sends binary command over WS
-  → Server deserializes command
-  → Server validates against World state
-    (conflict detection, permission checks, business rules)
-  → Server applies mutation to World (memory)
-  → Server increments revision
-  → Server flushes mutation to redb (async or sync — TBD)
-  → Server packs binary delta
-  → Server broadcasts delta to all connected clients
+```rust
+struct Service { id: Uuid, name: String }
 ```
 
-One codepath. One protocol. One serialization format.
+12 default services. Metadata TBD when real data sources arrive.
 
-### Persistence
+### User — a player
 
-redb is a save file. The server does NOT query redb at runtime.
+```rust
+struct User { id: Uuid, username: String, password_hash: String }
+```
 
-- Boot: load everything from redb into World
-- Mutation: write-through to redb after applying to memory
-- Crash recovery: reboot, reload from redb (ACID guarantees)
-- redb transactions are cheap for single writes at this scale
+---
 
-## Protocol — WebSocket binary (implemented)
+## Wire Protocol — WebSocket Binary
 
-All data over WebSocket uses fixed-stride packed binary, readable by JS
-DataView at known offsets. See `backend/src/wire.rs` for the authoritative
-byte layout. JSON is never used in the data path.
+All game data over WebSocket uses fixed-stride packed binary, readable by
+DataView at known offsets. JSON is never used in the data path.
 
 ### Task record (192 bytes, fixed stride)
 
@@ -144,9 +321,6 @@ byte layout. JSON is never used in the data path.
 [56..184]  title (128 bytes, UTF-8, zero-padded)
 [184..192] _reserved
 ```
-
-Day-of-week is derived from epoch days: `(date + 3) % 7` gives 0=Mon..6=Sun
-(Jan 1 1970 = Thursday = day 3 in 0=Mon numbering).
 
 ### Service record (80 bytes, fixed stride)
 
@@ -165,6 +339,8 @@ First byte is message type:
 - `0x05` TaskUnscheduled: `[type][rev:u64][task_id:16]`
 - `0x06` TaskCompleted: `[type][rev:u64][task_id:16]`
 - `0x07` TaskDeleted: `[type][rev:u64][task_id:16]`
+- `0x10` BackgroundImage: `[type][rev:u64][format:u8][width:u16][height:u16][bytes...]`
+- `0x11` CandidateList: `[type][count:u8][[task_id:16][x:u16][y:u16][w:u16][h:u16]...]`
 
 ### Client → Server commands
 
@@ -174,193 +350,147 @@ First byte is message type:
 - `0x13` UnscheduleTask: `[type][task_id:16]`
 - `0x14` CompleteTask: `[type][task_id:16]`
 - `0x15` DeleteTask: `[type][task_id:16]`
-
-### JS reading example
-
-```javascript
-const view = new DataView(buffer);
-// In a snapshot, task records start at offset 17
-const TASK_STRIDE = 192;
-const taskOffset = 17 + (i * TASK_STRIDE);
-const status    = view.getUint8(taskOffset + 16);
-const priority  = view.getUint8(taskOffset + 17);
-const date      = view.getUint16(taskOffset + 18, true); // epoch days, 0xFFFF = staged
-const startTime = view.getUint16(taskOffset + 20, true); // LE
-const duration  = view.getUint16(taskOffset + 22, true); // LE
-const col       = (date + 3) % 7;                        // 0=Mon..6=Sun
-```
+- `0x20` CursorMove: `[type][x:u16][y:u16]` (sent at 20Hz)
+- `0x21` ModeChange: `[type][mode:u8]` (IDLE=0, DRAG=1, TYPING=2, MONTH=3, COLLAPSED=4)
+- `0x22` ClickAt: `[type][x:u16][y:u16]`
 
 ### Sync semantics
 
-- Every event carries a revision number (u64 LE at offset 1)
-- Client tracks last_seen_rev
-- On reconnect: client sends last_seen_rev, server sends deltas since then
-  (or full snapshot if gap is too large)
-- Server arbitrates conflicts (last write wins for now, smarter later)
+Every event carries a revision number (u64 LE at offset 1). Client tracks
+last_seen_rev. On reconnect: client sends last_seen_rev, sidecar sends deltas
+since then (or full snapshot if gap too large).
 
-## Data model — minimal until real data arrives
+---
 
-The model stays thin until we connect to real enterprise data sources
-(ServiceNow, custom APIs). Only what IRONCLAD needs to render:
+## Server Internals — World State Machine
 
-### Task (the unit of work)
+The sidecar's core is a pure state machine with zero I/O.
 
-Core identity:
-- id, title, service_id, created_by
+```rust
+struct World {
+    tasks: HashMap<Uuid, Task>,
+    users: HashMap<Uuid, User>,
+    services: HashMap<Uuid, Service>,
+    revision: u64,
+    connections: HashMap<ConnectionId, PlayerSession>,
+}
 
-Scheduling (what IRONCLAD renders on the grid):
-- date (u16 epoch days since 1970-01-01; 0xFFFF = staged/unscheduled)
-- start_time (minutes from midnight, snapped to 15-min grid)
-- duration (minutes, snapped to 15-min grid)
-- assigned_to (who owns this time slot)
+impl World {
+    fn apply(&mut self, cmd: Command, user_id: Uuid) -> Result<Event, WorldError>
+}
+```
 
-State:
-- status: Staged | Scheduled | Active | Completed
-  (Staged = no time slot. Scheduled = has a slot. Active = being worked now.)
-- priority: Low | Medium | High | Urgent (drives staging auto-sort)
+Every mutation: validate → apply to memory → increment revision → return Event.
+The Event is what gets rendered and broadcast.
 
-### Service (who pays for the time)
+**Persistence:** redb is a save file. Loaded on boot, flushed on mutation.
+Never queried at runtime.
 
-- id, name
-- Metadata TBD when real data sources arrive
+---
 
-### User (a player)
-
-- id, username, password_hash
-
-Everything else (category, tags, description, due_date) is deferred until
-real data tells us what it should be.
-
-## Key decisions
+## Key Decisions
 
 ### No JSON in the data path
-
-- **Storage**: postcard (binary, serde-compatible). Interim until rkyv
-  (zero-copy) when we optimize the in-memory serve layer.
-- **Wire (WebSocket)**: hand-rolled packed binary. DataView on client.
-- **REST (auth only)**: JSON is fine. Called once per session.
+JSON only at the auth boundary (login). Everything else is binary packed structs.
 
 ### redb stays
+Pure Rust, single-file, ACID. Treated as a save file. Load once, flush on
+mutation, never query at runtime.
 
-Pure Rust, single-file, ACID. Treated as a save file, not a query engine.
-Loaded on boot, flushed on mutation.
+### One div at a time
+The browser never has more than one interactive DOM element at any moment.
+This is an architectural constraint, not a guideline. Zero divs at rest.
 
-### IRONCLAD is the renderer, period
+### Sidecar renders, browser displays
+The browser does not compute pixel positions from task data. The sidecar
+renders the world to an image and sends it. Rendering logic lives in exactly
+one place.
 
-The server decides what exists and where. IRONCLAD draws it.
+### Browser never does hit testing
+The browser forwards click coordinates. The sidecar holds the candidate list
+and responds with bounds. No client-side spatial queries.
 
-### Security is deferred
-
-Dev-mode auth bypass active. Hardcoded JWT secret. Do not deploy publicly.
-Hardening is a future phase after the system works. This is an internal tool
-for a known workgroup — if it ever graduates to a wider deployment, that will
-be a different project with proper SDLC and security review from scratch.
+### 20Hz cursor forwarding
+Human reaction time is 100-200ms. 20Hz (50ms intervals) is sufficient for
+responsive hit detection. Forwarding at 60Hz burns CPU and bandwidth for no
+perceptible gain.
 
 ### No protocol versioning — intentional
+Server and clients are always deployed together from the same repo. No window
+where mismatched versions talk to each other. Wire format changes are breaking
+changes by design — update everything and redeploy.
 
-There are no version bytes in the wire format. This is a deliberate decision,
-not an oversight.
+### No CRDT
+Last-write-wins. 5-20 users. Two people move the same task simultaneously?
+Server processes in order, second write wins. CRDT is massive over-engineering
+for this scale.
 
-Protocol versioning exists to handle clients and servers running different
-versions simultaneously. That problem does not exist here: server and clients
-are always deployed together from the same repo. When the wire format changes,
-both sides are updated in the same commit. There is no window where a v1 client
-talks to a v2 server.
+### No cursor/presence sharing (yet)
+Mouse positions at 20Hz × 20 users = 400 messages/sec to EC2. Value is real
+for a collaborative scheduling tool but the architecture for it (unreliable
+broadcast channel, ghost cursors rendered into image) is a future phase.
 
-Adding version negotiation would be complexity solving a problem we don't have.
-Wire format changes are breaking changes by definition — the correct response is
-to update everything and redeploy, not to pad frames with compatibility shims.
+### Security deferred
+Dev-mode auth bypass active. Hardcoded JWT secret. Internal tool for a known
+workgroup on a VPN. Hardening is a future phase.
 
-The audience is ops engineers, not passive users. Anyone on the team can read
-the wire format in `wire.rs` and fix a mismatch in minutes. Keep it lean.
+### No protocol versioning
+No version bytes in wire format. Intentional. See above.
 
-## Current backend state (updated 2026-02-10)
+---
 
-The game server architecture is implemented. The old webdev-CRUD layer has
-been removed. What exists now:
+## Interaction Gestures
 
-### Modules
+All scheduling happens through direct manipulation. No forms. No modals.
+The world IS the interface.
 
-- **world.rs** — Pure state machine. `World` struct with HashMap entity
-  storage, `Command`/`Event` enums, `apply()` mutation codepath, revision
-  counter, event log, staging queue. Zero IO, fully unit-tested (17 tests).
+| Gesture           | Action               | Status       |
+|-------------------|----------------------|--------------|
+| Click task        | Materialize, select  | IN PROGRESS  |
+| Drag task         | Move to slot         | DONE (canvas era, to port) |
+| Double-click grid | Create 30m task      | DONE (canvas era, to port) |
+| Drag bottom edge  | Resize duration      | DONE (canvas era, to port) |
+| Alt+drag          | Clone task           | DONE (canvas era, to port) |
+| Alt-C             | Collapse calendar    | DONE         |
+| Alt-M             | Monthly view         | DONE (read-only) |
+| Modifier-click    | Manual entry         | DEFERRED     |
 
-- **persist.rs** — `SaveFile` wrapper around redb. `load_world()` on boot,
-  `flush()` on every mutation (sync write-through). Seeding helpers for
-  default services/user. Tested with real redb files (4 tests).
+"Canvas era" = implemented in current IRONCLAD canvas code, to be ported
+to the div-materialization model once the sidecar image pipeline is built.
 
-- **game.rs** — WebSocket handler at `/api/game`. On connect: subscribes to
-  broadcast, sends binary Snapshot, then enters command/event loop. Uses
-  postcard for wire serialization (interim — fixed-stride DataView planned).
+---
 
-- **auth.rs** — Login handler at `POST /api/auth/login`. Reads users from
-  World (not from a separate database). JWT tokens. Dev-mode auth bypass on
-  WS (no token required yet).
+## Keybinds
 
-- **main.rs** — Boot sequence: open SaveFile → load World → seed defaults →
-  create broadcast channel → start axum. ~90 lines.
+Keybinds receive equal design priority to mouse gestures. Any action
+reachable by mouse must have a keyboard path. Alt-X bindings are
+view-independent: wherever you are, Alt-X does its thing.
 
-### Removed
-- `api.rs` — REST CRUD endpoints (replaced by WS commands)
-- `ws.rs` — JSON WebSocket handler (replaced by binary game.rs)
-- `db.rs` — Old database layer (replaced by persist.rs + World)
-- `models.rs` — Old model types (replaced by world.rs types)
+See KEYBINDS.md for the full active and candidate list.
 
-### Test coverage
-21 unit tests covering: task lifecycle (create/schedule/move/unschedule/
-complete/delete), validation (day/time/duration bounds, status transitions),
-revision counter, event log, staging queue sorting, redb round-trips.
+---
 
-## Dependencies — audit pending
+## What's Archived
 
-Current (11 direct deps, ~284 transitive):
-axum, tokio, redb, serde, serde_json, postcard, uuid, argon2, jsonwebtoken,
-tower-http, chrono, futures-util.
+`archive/` contains the Clay/WASM era: dead frontend experiment, old handover
+docs, screenshots, scratch files. Kept for reference.
 
-Cleaned 2026-02-10: removed `rand`, `tower 0.4`, `futures` (dead weight).
+The current `frontend/ironclad.js` (canvas rendering era) is living code but
+represents the intermediate step before the sidecar image pipeline. The wire
+protocol, SoA structure, and input handling are keepers. The canvas drawing
+code is not the final form.
 
-**Needs a deep analysis session:**
-- **jsonwebtoken** — heaviest dep (ring C/ASM crypto). Replace with session
-  tokens in redb, or HMAC-SHA256.
-- **tower-http** — ServeDir + CORS. Hand-rollable but tedious.
-- **chrono** — swap to `time` crate or timestamps-as-i64 when model finalizes.
-- **postcard** — interim. rkyv is the target for zero-copy.
-
-## What's archived
-
-`archive/` contains the Clay/WASM era: dead frontend, old handover docs,
-screenshots, scratch files. Kept for reference.
-
-## Interaction model — how users touch the grid
-
-All scheduling happens through direct manipulation on the calendar canvas.
-No forms, no modals, no dropdowns. The grid IS the interface.
-
-| Gesture              | Action         | Status   |
-|----------------------|----------------|----------|
-| Drag task            | Move to slot   | DONE     |
-| Double-click grid    | Create 30m task| NEXT     |
-| Drag bottom edge     | Resize duration| DONE     |
-| Alt+drag (mod-drag)  | Clone task     | PLANNED  |
-| Modifier-click       | Manual entry   | DEFERRED |
-
-**Snap resolution** (planned): moves snap to 30 minutes (coarse),
-resizes snap to 5 minutes (fine). Currently everything is 15-minute grid.
-
-All gestures produce binary WS commands — the server validates and
-broadcasts. The client never mutates local state optimistically.
-
-See `INTERACTIONS.md` for detailed rationale, edge cases, and pushback
-on multi-day / recurring tasks.
+---
 
 ## Philosophy
 
-- This is a game server, not a web API.
-- The server owns the world. Clients are renderers.
-- No blocking UI. Docked panels, not modals.
-- Performance is a feature. Zero allocations in hot paths.
-- Binary everything. JSON only at auth boundary.
+- **Everything is possible but nothing is real until the click.**
+- The browser is glass. The sidecar is the brain.
+- Static image between interactions. One div during interaction. Nothing else.
+- Performance is a feature. On a CloudPC, performance is survival.
+- VDI bandwidth is precious. Don't move pixels you don't have to.
 - Keyboard-first. Mouse works too.
-- Services are the primary axis ("who pays for the time").
+- Services are the primary axis of meaning ("who pays for the time").
+- No speculative features. Build what ops teams need, not what might be needed.
 - Security later. Correctness and speed now.
-- No speculative features. Build what's needed, not what might be.
+- Binary everything. JSON only at auth boundary.
