@@ -68,6 +68,7 @@ async fn main() {
         // Auth (REST, JSON — called once per session)
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
+        .route("/api/render", axum::routing::get(renderer::render_handler))
         // Game WebSocket (binary protocol — the real data path)
         .route("/api/game", get(game::ws_handler))
         // Static files — serve IRONCLAD renderer from txxt2 repo

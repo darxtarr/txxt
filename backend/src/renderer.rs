@@ -168,6 +168,37 @@ fn fill_rect(pixmap: &mut Pixmap, paint: &Paint, x: f32, y: f32, w: f32, h: f32)
     }
 }
 
+// ── Debug endpoint ───────────────────────────────────────────────────────────
+
+/// GET /api/render — returns the current world as a PNG.
+/// Debug only: lets you see exactly what the sidecar would send to IRONCLAD.
+pub async fn render_handler(
+    axum::extract::State(state): axum::extract::State<crate::auth::SharedState>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let world = state.world.read().unwrap();
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let now_days = now_secs / 86400;
+    let dow = ((now_days + 3) % 7) as u16; // 0=Mon..6=Sun
+    let week_start = (now_days as u16).saturating_sub(dow);
+
+    let renderer = Renderer::new(1316, 632);
+    let view = ViewState { week_start };
+
+    match renderer.render_world(&world, &view) {
+        Some(png) => (
+            [(axum::http::header::CONTENT_TYPE, "image/png")],
+            png,
+        ).into_response(),
+        None => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
