@@ -41,8 +41,7 @@ pub mod msg {
 /// [0..16]    id (UUID, 16 bytes)
 /// [16]       status (u8: 0=Staged, 1=Scheduled, 2=Active, 3=Completed)
 /// [17]       priority (u8: 0=Low, 1=Medium, 2=High, 3=Urgent)
-/// [18..20]   date (u16 LE, epoch days since 1970-01-01, 0xFFFF = not scheduled)
-/// [20..22]   start_time (u16 LE, minutes from midnight)
+/// [18..22]   start (u32 LE, minutes since Unix epoch, 0xFFFF_FFFF = not scheduled)
 /// [22..24]   duration (u16 LE, minutes)
 /// [24..40]   service_id (UUID, 16 bytes)
 /// [40..56]   assigned_to (UUID, 16 bytes, zeroed = unassigned)
@@ -121,8 +120,7 @@ fn pack_task(buf: &mut [u8], task: &Task) {
     buf[0..16].copy_from_slice(task.id.as_bytes());
     buf[16] = task.status as u8;
     buf[17] = task.priority as u8;
-    buf[18..20].copy_from_slice(&task.date.unwrap_or(0xFFFF).to_le_bytes());
-    buf[20..22].copy_from_slice(&task.start_time.unwrap_or(0).to_le_bytes());
+    buf[18..22].copy_from_slice(&task.start.unwrap_or(0xFFFF_FFFF).to_le_bytes());
     buf[22..24].copy_from_slice(&task.duration.unwrap_or(0).to_le_bytes());
     buf[24..40].copy_from_slice(task.service_id.as_bytes());
     buf[40..56].copy_from_slice(
@@ -154,24 +152,22 @@ pub fn pack_event(event: &Event) -> Vec<u8> {
             buf
         }
 
-        Event::TaskScheduled { revision, task_id, date, start_time, duration } => {
+        Event::TaskScheduled { revision, task_id, start, duration } => {
             let mut buf = vec![0u8; EVENT_HEADER + 6];
             buf[0] = msg::TASK_SCHEDULED;
             buf[1..9].copy_from_slice(&revision.to_le_bytes());
             buf[9..25].copy_from_slice(task_id.as_bytes());
-            buf[25..27].copy_from_slice(&date.to_le_bytes());
-            buf[27..29].copy_from_slice(&start_time.to_le_bytes());
+            buf[25..29].copy_from_slice(&start.to_le_bytes());
             buf[29..31].copy_from_slice(&duration.to_le_bytes());
             buf
         }
 
-        Event::TaskMoved { revision, task_id, date, start_time, duration } => {
+        Event::TaskMoved { revision, task_id, start, duration } => {
             let mut buf = vec![0u8; EVENT_HEADER + 6];
             buf[0] = msg::TASK_MOVED;
             buf[1..9].copy_from_slice(&revision.to_le_bytes());
             buf[9..25].copy_from_slice(task_id.as_bytes());
-            buf[25..27].copy_from_slice(&date.to_le_bytes());
-            buf[27..29].copy_from_slice(&start_time.to_le_bytes());
+            buf[25..29].copy_from_slice(&start.to_le_bytes());
             buf[29..31].copy_from_slice(&duration.to_le_bytes());
             buf
         }
@@ -216,9 +212,8 @@ pub fn unpack_command(data: &[u8]) -> Result<Command, WireError> {
             // [1]      priority (u8)
             // [2..18]  service_id (UUID)
             // [18..34] assigned_to (UUID, zeroed = none)
-            // [34..36] date (u16 LE, epoch days, 0xFFFF = staged)
-            // [36..38] start_time (u16 LE)
-            // [38..40] duration (u16 LE)
+            // [34..38] start (u32 LE, minutes since epoch, 0xFFFF_FFFF = staged)
+            // [38..40] duration (u16 LE, ignored when staged)
             // [40..]   title (rest of frame, UTF-8, trimmed)
             if data.len() < 40 {
                 return Err(WireError::TooShort);
@@ -229,36 +224,33 @@ pub fn unpack_command(data: &[u8]) -> Result<Command, WireError> {
                 let uuid = uuid_from_bytes(&data[18..34]);
                 if uuid.is_nil() { None } else { Some(uuid) }
             };
-            let raw_date = u16::from_le_bytes([data[34], data[35]]);
-            let (date, start_time, duration) = if raw_date == 0xFFFF {
-                (None, None, None)
+            let raw_start = u32::from_le_bytes([data[34], data[35], data[36], data[37]]);
+            let (start, duration) = if raw_start == 0xFFFF_FFFF {
+                (None, None)
             } else {
                 (
-                    Some(raw_date),
-                    Some(u16::from_le_bytes([data[36], data[37]])),
+                    Some(raw_start),
                     Some(u16::from_le_bytes([data[38], data[39]])),
                 )
             };
             let title = string_from_bytes(&data[40..])?;
 
-            Ok(Command::CreateTask { title, service_id, priority, assigned_to, date, start_time, duration })
+            Ok(Command::CreateTask { title, service_id, priority, assigned_to, start, duration })
         }
 
         msg::CMD_SCHEDULE_TASK => {
             // [0]      msg type
             // [1..17]  task_id (UUID)
-            // [17..19] date (u16 LE, epoch days)
-            // [19..21] start_time (u16 LE)
+            // [17..21] start (u32 LE, minutes since epoch)
             // [21..23] duration (u16 LE)
             if data.len() < 23 {
                 return Err(WireError::TooShort);
             }
             let task_id = uuid_from_bytes(&data[1..17]);
-            let date = u16::from_le_bytes([data[17], data[18]]);
-            let start_time = u16::from_le_bytes([data[19], data[20]]);
+            let start = u32::from_le_bytes([data[17], data[18], data[19], data[20]]);
             let duration = u16::from_le_bytes([data[21], data[22]]);
 
-            Ok(Command::ScheduleTask { task_id, date, start_time, duration })
+            Ok(Command::ScheduleTask { task_id, start, duration })
         }
 
         msg::CMD_MOVE_TASK => {
@@ -267,11 +259,10 @@ pub fn unpack_command(data: &[u8]) -> Result<Command, WireError> {
                 return Err(WireError::TooShort);
             }
             let task_id = uuid_from_bytes(&data[1..17]);
-            let date = u16::from_le_bytes([data[17], data[18]]);
-            let start_time = u16::from_le_bytes([data[19], data[20]]);
+            let start = u32::from_le_bytes([data[17], data[18], data[19], data[20]]);
             let duration = u16::from_le_bytes([data[21], data[22]]);
 
-            Ok(Command::MoveTask { task_id, date, start_time, duration })
+            Ok(Command::MoveTask { task_id, start, duration })
         }
 
         msg::CMD_UNSCHEDULE_TASK => {
@@ -356,8 +347,8 @@ mod tests {
     use super::*;
     use crate::world::{Command, Priority, TaskStatus};
 
-    // 2026-02-11 = epoch day 20495
-    const D: u16 = 20495;
+    // 2026-02-11 = epoch day 20495 = minute 29_512_800
+    const D: u32 = 29_512_800;
 
     fn make_task() -> Task {
         Task {
@@ -368,8 +359,7 @@ mod tests {
             service_id: Uuid::from_bytes([2; 16]),
             created_by: Uuid::from_bytes([3; 16]),
             assigned_to: Some(Uuid::from_bytes([4; 16])),
-            date: Some(D),
-            start_time: Some(540),
+            start: Some(D + 540), // 2026-02-11 9:00 AM
             duration: Some(90),
         }
     }
@@ -406,10 +396,8 @@ mod tests {
         assert_eq!(&t[0..16], &[1u8; 16]); // id
         assert_eq!(t[16], TaskStatus::Scheduled as u8);
         assert_eq!(t[17], Priority::High as u8);
-        let date = u16::from_le_bytes([t[18], t[19]]);
-        assert_eq!(date, D); // epoch day
-        let start = u16::from_le_bytes([t[20], t[21]]);
-        assert_eq!(start, 540); // 9:00 AM
+        let start = u32::from_le_bytes([t[18], t[19], t[20], t[21]]);
+        assert_eq!(start, D + 540); // 2026-02-11 9:00 AM
         let dur = u16::from_le_bytes([t[22], t[23]]);
         assert_eq!(dur, 90);
         assert_eq!(&t[24..40], &[2u8; 16]); // service_id
@@ -432,8 +420,7 @@ mod tests {
         let event = Event::TaskMoved {
             revision: 7,
             task_id: Uuid::from_bytes([0xAA; 16]),
-            date: D,
-            start_time: 840,
+            start: D + 840, // 2026-02-11 2:00 PM
             duration: 60,
         };
 
@@ -442,10 +429,8 @@ mod tests {
         let rev = u64::from_le_bytes(buf[1..9].try_into().unwrap());
         assert_eq!(rev, 7);
         assert_eq!(&buf[9..25], &[0xAA; 16]); // task_id
-        let date = u16::from_le_bytes([buf[25], buf[26]]);
-        assert_eq!(date, D); // epoch day
-        let start = u16::from_le_bytes([buf[27], buf[28]]);
-        assert_eq!(start, 840); // 2:00 PM
+        let start = u32::from_le_bytes([buf[25], buf[26], buf[27], buf[28]]);
+        assert_eq!(start, D + 840);
         let dur = u16::from_le_bytes([buf[29], buf[30]]);
         assert_eq!(dur, 60);
     }
@@ -478,16 +463,14 @@ mod tests {
         let task_id = Uuid::from_bytes([0xCC; 16]);
         let mut data = vec![msg::CMD_MOVE_TASK];
         data.extend_from_slice(task_id.as_bytes());
-        data.extend_from_slice(&D.to_le_bytes()); // date (u16 LE)
-        data.extend_from_slice(&600u16.to_le_bytes()); // start_time (10:00)
-        data.extend_from_slice(&45u16.to_le_bytes());  // duration
+        data.extend_from_slice(&(D + 600u32).to_le_bytes()); // start (10:00 AM)
+        data.extend_from_slice(&45u16.to_le_bytes());        // duration
 
         let cmd = unpack_command(&data).unwrap();
         match cmd {
-            Command::MoveTask { task_id: id, date, start_time, duration } => {
+            Command::MoveTask { task_id: id, start, duration } => {
                 assert_eq!(id, task_id);
-                assert_eq!(date, D);
-                assert_eq!(start_time, 600);
+                assert_eq!(start, D + 600);
                 assert_eq!(duration, 45);
             }
             _ => panic!("expected MoveTask"),
@@ -500,21 +483,19 @@ mod tests {
         let mut data = vec![msg::CMD_CREATE_TASK];
         data.push(3); // priority = Urgent
         data.extend_from_slice(svc_id.as_bytes());
-        data.extend_from_slice(&[0u8; 16]); // assigned_to = none
-        data.extend_from_slice(&0xFFFFu16.to_le_bytes()); // date = staged sentinel
-        data.extend_from_slice(&0u16.to_le_bytes());  // start_time (ignored)
-        data.extend_from_slice(&0u16.to_le_bytes());  // duration (ignored)
+        data.extend_from_slice(&[0u8; 16]);                      // assigned_to = none
+        data.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());   // start = staged sentinel
+        data.extend_from_slice(&0u16.to_le_bytes());             // duration (ignored)
         data.extend_from_slice(b"Fix the pipeline");
 
         let cmd = unpack_command(&data).unwrap();
         match cmd {
-            Command::CreateTask { title, service_id, priority, assigned_to, date, start_time, duration } => {
+            Command::CreateTask { title, service_id, priority, assigned_to, start, duration } => {
                 assert_eq!(title, "Fix the pipeline");
                 assert_eq!(service_id, svc_id);
                 assert_eq!(priority, Priority::Urgent);
                 assert_eq!(assigned_to, None);
-                assert_eq!(date, None);
-                assert_eq!(start_time, None);
+                assert_eq!(start, None);
                 assert_eq!(duration, None);
             }
             _ => panic!("expected CreateTask"),
@@ -527,20 +508,18 @@ mod tests {
         let mut data = vec![msg::CMD_CREATE_TASK];
         data.push(1); // priority = Medium
         data.extend_from_slice(svc_id.as_bytes());
-        data.extend_from_slice(&[0u8; 16]); // assigned_to = none
-        data.extend_from_slice(&D.to_le_bytes()); // date = 2026-02-11 (u16 LE)
-        data.extend_from_slice(&540u16.to_le_bytes());  // start_time = 9:00
-        data.extend_from_slice(&30u16.to_le_bytes());   // duration = 30min
+        data.extend_from_slice(&[0u8; 16]);                   // assigned_to = none
+        data.extend_from_slice(&(D + 540u32).to_le_bytes()); // start = 2026-02-11 9:00 AM
+        data.extend_from_slice(&30u16.to_le_bytes());         // duration = 30min
         data.extend_from_slice(b"New task");
 
         let cmd = unpack_command(&data).unwrap();
         match cmd {
-            Command::CreateTask { title, service_id, priority, date, start_time, duration, .. } => {
+            Command::CreateTask { title, service_id, priority, start, duration, .. } => {
                 assert_eq!(title, "New task");
                 assert_eq!(service_id, svc_id);
                 assert_eq!(priority, Priority::Medium);
-                assert_eq!(date, Some(D));
-                assert_eq!(start_time, Some(540));
+                assert_eq!(start, Some(D + 540));
                 assert_eq!(duration, Some(30));
             }
             _ => panic!("expected CreateTask"),
@@ -568,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_task_date_is_0xffff() {
+    fn staged_task_start_is_sentinel() {
         let task = Task {
             id: Uuid::nil(),
             title: "Staged".into(),
@@ -577,14 +556,13 @@ mod tests {
             service_id: Uuid::nil(),
             created_by: Uuid::nil(),
             assigned_to: None,
-            date: None,
-            start_time: None,
+            start: None,
             duration: None,
         };
 
         let mut buf = vec![0u8; TASK_STRIDE];
         pack_task(&mut buf, &task);
-        let date = u16::from_le_bytes([buf[18], buf[19]]);
-        assert_eq!(date, 0xFFFF); // unscheduled sentinel
+        let start = u32::from_le_bytes([buf[18], buf[19], buf[20], buf[21]]);
+        assert_eq!(start, 0xFFFF_FFFF); // unscheduled sentinel
     }
 }

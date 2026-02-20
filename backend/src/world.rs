@@ -7,7 +7,7 @@ use uuid::Uuid;
 /// Task status lifecycle: Staged → Scheduled → Active → Completed
 ///
 /// Staged    = exists but has no time slot (lives in the staging queue)
-/// Scheduled = has a day + time slot on the grid
+/// Scheduled = has a slot on the timeline
 /// Active    = being worked right now
 /// Completed = done
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,8 +30,11 @@ pub enum Priority {
 
 /// A task — the unit of work on the scheduling grid.
 ///
-/// Scheduling fields (date, start_time, duration) are only meaningful
-/// when status is Scheduled or Active. When Staged, they're None.
+/// `start` is minutes since Unix epoch (None = Staged).
+/// Derive everything from it:
+///   epoch_day    = start / 1440
+///   day_of_week  = (epoch_day + 3) % 7  →  0=Mon .. 6=Sun
+///   time_of_day  = start % 1440         →  minutes from midnight
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: Uuid,
@@ -41,12 +44,9 @@ pub struct Task {
     pub service_id: Uuid,
     pub created_by: Uuid,
     pub assigned_to: Option<Uuid>,
-    /// Calendar date: days since Unix epoch (1970-01-01 = 0). None if Staged.
-    /// Day-of-week is derived: (date + 3) % 7 → 0=Mon .. 6=Sun.
-    pub date: Option<u16>,
-    /// Minutes from midnight, snapped to 15-min grid. None if Staged.
-    pub start_time: Option<u16>,
-    /// Duration in minutes, snapped to 15-min grid. None if Staged.
+    /// Minutes since Unix epoch. None if Staged.
+    pub start: Option<u32>,
+    /// Duration in minutes. None if Staged.
     pub duration: Option<u16>,
 }
 
@@ -74,22 +74,19 @@ pub enum Command {
         service_id: Uuid,
         priority: Priority,
         assigned_to: Option<Uuid>,
-        /// If all three scheduling fields are Some, create directly as Scheduled.
-        /// If None, create as Staged (existing behavior).
-        date: Option<u16>,
-        start_time: Option<u16>,
+        /// If both scheduling fields are Some, create directly as Scheduled.
+        /// If None, create as Staged.
+        start: Option<u32>,
         duration: Option<u16>,
     },
     ScheduleTask {
         task_id: Uuid,
-        date: u16,
-        start_time: u16,
+        start: u32,
         duration: u16,
     },
     MoveTask {
         task_id: Uuid,
-        date: u16,
-        start_time: u16,
+        start: u32,
         duration: u16,
     },
     UnscheduleTask {
@@ -116,15 +113,13 @@ pub enum Event {
     TaskScheduled {
         revision: u64,
         task_id: Uuid,
-        date: u16,
-        start_time: u16,
+        start: u32,
         duration: u16,
     },
     TaskMoved {
         revision: u64,
         task_id: Uuid,
-        date: u16,
-        start_time: u16,
+        start: u32,
         duration: u16,
     },
     TaskUnscheduled {
@@ -147,8 +142,6 @@ pub enum Event {
 pub enum WorldError {
     TaskNotFound,
     ServiceNotFound,
-    InvalidDate,
-    InvalidTime,
     InvalidDuration,
     /// Task is already in the requested state
     InvalidTransition,
@@ -183,19 +176,19 @@ impl World {
     /// This is THE mutation codepath — every state change goes through here.
     pub fn apply(&mut self, cmd: Command, user_id: Uuid) -> Result<Event, WorldError> {
         match cmd {
-            Command::CreateTask { title, service_id, priority, assigned_to, date, start_time, duration } => {
+            Command::CreateTask { title, service_id, priority, assigned_to, start, duration } => {
                 // Validate: service must exist
                 if !self.services.contains_key(&service_id) {
                     return Err(WorldError::ServiceNotFound);
                 }
 
-                // If all scheduling fields provided, validate and create as Scheduled
-                let (status, date, start_time, duration) = match (date, start_time, duration) {
-                    (Some(d), Some(st), Some(dur)) => {
-                        validate_scheduling(d, st, dur)?;
-                        (TaskStatus::Scheduled, Some(d), Some(st), Some(dur))
+                // If both scheduling fields provided, validate and create as Scheduled
+                let (status, start, duration) = match (start, duration) {
+                    (Some(s), Some(dur)) => {
+                        validate_scheduling(dur)?;
+                        (TaskStatus::Scheduled, Some(s), Some(dur))
                     }
-                    _ => (TaskStatus::Staged, None, None, None),
+                    _ => (TaskStatus::Staged, None, None),
                 };
 
                 let task = Task {
@@ -206,8 +199,7 @@ impl World {
                     service_id,
                     created_by: user_id,
                     assigned_to,
-                    date,
-                    start_time,
+                    start,
                     duration,
                 };
 
@@ -221,8 +213,8 @@ impl World {
                 Ok(event)
             }
 
-            Command::ScheduleTask { task_id, date, start_time, duration } => {
-                validate_scheduling(date, start_time, duration)?;
+            Command::ScheduleTask { task_id, start, duration } => {
+                validate_scheduling(duration)?;
 
                 let task = self.tasks.get_mut(&task_id)
                     .ok_or(WorldError::TaskNotFound)?;
@@ -233,24 +225,22 @@ impl World {
                 }
 
                 task.status = TaskStatus::Scheduled;
-                task.date = Some(date);
-                task.start_time = Some(start_time);
+                task.start = Some(start);
                 task.duration = Some(duration);
 
                 self.revision += 1;
                 let event = Event::TaskScheduled {
                     revision: self.revision,
                     task_id,
-                    date,
-                    start_time,
+                    start,
                     duration,
                 };
                 self.log.push((self.revision, event.clone()));
                 Ok(event)
             }
 
-            Command::MoveTask { task_id, date, start_time, duration } => {
-                validate_scheduling(date, start_time, duration)?;
+            Command::MoveTask { task_id, start, duration } => {
+                validate_scheduling(duration)?;
 
                 let task = self.tasks.get_mut(&task_id)
                     .ok_or(WorldError::TaskNotFound)?;
@@ -260,16 +250,14 @@ impl World {
                     return Err(WorldError::InvalidTransition);
                 }
 
-                task.date = Some(date);
-                task.start_time = Some(start_time);
+                task.start = Some(start);
                 task.duration = Some(duration);
 
                 self.revision += 1;
                 let event = Event::TaskMoved {
                     revision: self.revision,
                     task_id,
-                    date,
-                    start_time,
+                    start,
                     duration,
                 };
                 self.log.push((self.revision, event.clone()));
@@ -286,8 +274,7 @@ impl World {
                 }
 
                 task.status = TaskStatus::Staged;
-                task.date = None;
-                task.start_time = None;
+                task.start = None;
                 task.duration = None;
 
                 self.revision += 1;
@@ -368,19 +355,10 @@ impl World {
 
 /// Validate scheduling fields.
 ///
-/// date: epoch days (any value except 0xFFFF which is the staged sentinel)
-/// start_time: minutes from midnight, must be on 15-min grid
-/// duration: minutes, must be on 15-min grid, must not overflow past midnight
-fn validate_scheduling(date: u16, start_time: u16, duration: u16) -> Result<(), WorldError> {
-    if date == 0xFFFF {
-        return Err(WorldError::InvalidDate);
-    }
-    // 24 hours = 1440 minutes. Must be on 15-min grid.
-    if start_time >= 1440 || start_time % 15 != 0 {
-        return Err(WorldError::InvalidTime);
-    }
-    // Duration: at least 15 min, on 15-min grid, doesn't go past midnight
-    if duration == 0 || duration % 15 != 0 || start_time + duration > 1440 {
+/// The server only enforces that duration is non-zero.
+/// 15-minute snapping is a UI constraint only.
+fn validate_scheduling(duration: u16) -> Result<(), WorldError> {
+    if duration == 0 {
         return Err(WorldError::InvalidDuration);
     }
     Ok(())
@@ -392,9 +370,10 @@ fn validate_scheduling(date: u16, start_time: u16, duration: u16) -> Result<(), 
 mod tests {
     use super::*;
 
-    // A known Wednesday (2026-02-11). Use this as a representative test date.
-    const D: u16 = 20495;
-    const D2: u16 = 20496; // Thursday 2026-02-12
+    // 2026-02-11 (Wednesday) = epoch day 20495 = minute 29_512_800
+    // 2026-02-12 (Thursday)  = epoch day 20496 = minute 29_514_240
+    const D:  u32 = 29_512_800; // 2026-02-11 midnight
+    const D2: u32 = 29_514_240; // 2026-02-12 midnight
 
     fn test_world() -> World {
         let mut w = World::new();
@@ -412,8 +391,7 @@ mod tests {
                 service_id: Uuid::nil(),
                 priority: Priority::Medium,
                 assigned_to: None,
-                date: None,
-                start_time: None,
+                start: None,
                 duration: None,
             },
             Uuid::nil(),
@@ -432,8 +410,8 @@ mod tests {
 
         let task = &w.tasks[&id];
         assert_eq!(task.status, TaskStatus::Staged);
-        assert_eq!(task.date, None);
-        assert_eq!(task.start_time, None);
+        assert_eq!(task.start, None);
+        assert_eq!(task.duration, None);
         assert_eq!(w.revision, 1);
     }
 
@@ -446,8 +424,7 @@ mod tests {
                 service_id: Uuid::nil(),
                 priority: Priority::Medium,
                 assigned_to: None,
-                date: Some(D),
-                start_time: Some(540),
+                start: Some(D + 540), // 2026-02-11 9:00 AM
                 duration: Some(30),
             },
             Uuid::nil(),
@@ -460,28 +437,8 @@ mod tests {
 
         let task = &w.tasks[&id];
         assert_eq!(task.status, TaskStatus::Scheduled);
-        assert_eq!(task.date, Some(D));
-        assert_eq!(task.start_time, Some(540));
+        assert_eq!(task.start, Some(D + 540));
         assert_eq!(task.duration, Some(30));
-    }
-
-    #[test]
-    fn create_task_with_staged_sentinel_rejected() {
-        // 0xFFFF is the staged sentinel — passing it as a date is invalid
-        let mut w = test_world();
-        let result = w.apply(
-            Command::CreateTask {
-                title: "Bad".into(),
-                service_id: Uuid::nil(),
-                priority: Priority::Medium,
-                assigned_to: None,
-                date: Some(0xFFFF),
-                start_time: Some(540),
-                duration: Some(30),
-            },
-            Uuid::nil(),
-        );
-        assert_eq!(result.unwrap_err(), WorldError::InvalidDate);
     }
 
     #[test]
@@ -493,8 +450,7 @@ mod tests {
                 service_id: Uuid::new_v4(),
                 priority: Priority::Low,
                 assigned_to: None,
-                date: None,
-                start_time: None,
+                start: None,
                 duration: None,
             },
             Uuid::nil(),
@@ -509,15 +465,14 @@ mod tests {
         let id = create_task(&mut w);
 
         w.apply(
-            Command::ScheduleTask { task_id: id, date: D, start_time: 540, duration: 60 },
+            Command::ScheduleTask { task_id: id, start: D + 540, duration: 60 },
             Uuid::nil(),
         ).unwrap();
 
         let task = &w.tasks[&id];
         assert_eq!(task.status, TaskStatus::Scheduled);
-        assert_eq!(task.date, Some(D));
-        assert_eq!(task.start_time, Some(540)); // 9:00 AM
-        assert_eq!(task.duration, Some(60));    // 1 hour
+        assert_eq!(task.start, Some(D + 540)); // 9:00 AM
+        assert_eq!(task.duration, Some(60));   // 1 hour
         assert_eq!(w.revision, 2);
     }
 
@@ -527,12 +482,12 @@ mod tests {
         let id = create_task(&mut w);
 
         w.apply(
-            Command::ScheduleTask { task_id: id, date: D, start_time: 480, duration: 30 },
+            Command::ScheduleTask { task_id: id, start: D + 480, duration: 30 },
             Uuid::nil(),
         ).unwrap();
 
         let result = w.apply(
-            Command::ScheduleTask { task_id: id, date: D2, start_time: 600, duration: 30 },
+            Command::ScheduleTask { task_id: id, start: D2 + 600, duration: 30 },
             Uuid::nil(),
         );
         assert_eq!(result.unwrap_err(), WorldError::InvalidTransition);
@@ -544,19 +499,18 @@ mod tests {
         let id = create_task(&mut w);
 
         w.apply(
-            Command::ScheduleTask { task_id: id, date: D, start_time: 480, duration: 60 },
+            Command::ScheduleTask { task_id: id, start: D + 480, duration: 60 },
             Uuid::nil(),
         ).unwrap();
 
         w.apply(
-            Command::MoveTask { task_id: id, date: D2, start_time: 840, duration: 90 },
+            Command::MoveTask { task_id: id, start: D2 + 840, duration: 90 },
             Uuid::nil(),
         ).unwrap();
 
         let task = &w.tasks[&id];
-        assert_eq!(task.date, Some(D2));
-        assert_eq!(task.start_time, Some(840)); // 2:00 PM
-        assert_eq!(task.duration, Some(90));    // 1.5 hours
+        assert_eq!(task.start, Some(D2 + 840)); // Thursday 2:00 PM
+        assert_eq!(task.duration, Some(90));     // 1.5 hours
         assert_eq!(w.revision, 3);
     }
 
@@ -566,7 +520,7 @@ mod tests {
         let id = create_task(&mut w);
 
         let result = w.apply(
-            Command::MoveTask { task_id: id, date: D, start_time: 480, duration: 60 },
+            Command::MoveTask { task_id: id, start: D + 480, duration: 60 },
             Uuid::nil(),
         );
         assert_eq!(result.unwrap_err(), WorldError::InvalidTransition);
@@ -578,7 +532,7 @@ mod tests {
         let id = create_task(&mut w);
 
         w.apply(
-            Command::ScheduleTask { task_id: id, date: D, start_time: 600, duration: 30 },
+            Command::ScheduleTask { task_id: id, start: D + 600, duration: 30 },
             Uuid::nil(),
         ).unwrap();
 
@@ -586,8 +540,7 @@ mod tests {
 
         let task = &w.tasks[&id];
         assert_eq!(task.status, TaskStatus::Staged);
-        assert_eq!(task.date, None);
-        assert_eq!(task.start_time, None);
+        assert_eq!(task.start, None);
         assert_eq!(task.duration, None);
     }
 
@@ -597,7 +550,7 @@ mod tests {
         let id = create_task(&mut w);
 
         w.apply(
-            Command::ScheduleTask { task_id: id, date: D, start_time: 480, duration: 60 },
+            Command::ScheduleTask { task_id: id, start: D + 480, duration: 60 },
             Uuid::nil(),
         ).unwrap();
 
@@ -643,19 +596,19 @@ mod tests {
         w.apply(Command::CreateTask {
             title: "Low".into(), service_id: Uuid::nil(),
             priority: Priority::Low, assigned_to: None,
-            date: None, start_time: None, duration: None,
+            start: None, duration: None,
         }, user).unwrap();
 
         w.apply(Command::CreateTask {
             title: "Urgent".into(), service_id: Uuid::nil(),
             priority: Priority::Urgent, assigned_to: None,
-            date: None, start_time: None, duration: None,
+            start: None, duration: None,
         }, user).unwrap();
 
         w.apply(Command::CreateTask {
             title: "High".into(), service_id: Uuid::nil(),
             priority: Priority::High, assigned_to: None,
-            date: None, start_time: None, duration: None,
+            start: None, duration: None,
         }, user).unwrap();
 
         let queue = w.staging_queue();
@@ -670,30 +623,9 @@ mod tests {
         let mut w = test_world();
         let id = create_task(&mut w);
 
-        // Staged sentinel (0xFFFF) is not a valid date
+        // Duration zero is invalid
         let r = w.apply(
-            Command::ScheduleTask { task_id: id, date: 0xFFFF, start_time: 480, duration: 60 },
-            Uuid::nil(),
-        );
-        assert_eq!(r.unwrap_err(), WorldError::InvalidDate);
-
-        // Time not on 15-min grid
-        let r = w.apply(
-            Command::ScheduleTask { task_id: id, date: D, start_time: 487, duration: 60 },
-            Uuid::nil(),
-        );
-        assert_eq!(r.unwrap_err(), WorldError::InvalidTime);
-
-        // Duration zero
-        let r = w.apply(
-            Command::ScheduleTask { task_id: id, date: D, start_time: 480, duration: 0 },
-            Uuid::nil(),
-        );
-        assert_eq!(r.unwrap_err(), WorldError::InvalidDuration);
-
-        // Goes past midnight
-        let r = w.apply(
-            Command::ScheduleTask { task_id: id, date: D, start_time: 1380, duration: 120 },
+            Command::ScheduleTask { task_id: id, start: D + 480, duration: 0 },
             Uuid::nil(),
         );
         assert_eq!(r.unwrap_err(), WorldError::InvalidDuration);
@@ -708,13 +640,13 @@ mod tests {
         assert_eq!(w.revision, 1);
 
         w.apply(
-            Command::ScheduleTask { task_id: id, date: D, start_time: 480, duration: 60 },
+            Command::ScheduleTask { task_id: id, start: D + 480, duration: 60 },
             Uuid::nil(),
         ).unwrap();
         assert_eq!(w.revision, 2);
 
         w.apply(
-            Command::MoveTask { task_id: id, date: D2, start_time: 600, duration: 30 },
+            Command::MoveTask { task_id: id, start: D2 + 600, duration: 30 },
             Uuid::nil(),
         ).unwrap();
         assert_eq!(w.revision, 3);
@@ -729,7 +661,7 @@ mod tests {
         let id = create_task(&mut w);
 
         w.apply(
-            Command::ScheduleTask { task_id: id, date: D, start_time: 480, duration: 60 },
+            Command::ScheduleTask { task_id: id, start: D + 480, duration: 60 },
             Uuid::nil(),
         ).unwrap();
 

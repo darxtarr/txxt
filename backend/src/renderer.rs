@@ -19,7 +19,6 @@ const HOUR_HEIGHT: f32 = 60.0;
 const DAYS:        u32 = 7;
 const START_HOUR:  u32 = 8;
 const END_HOUR:    u32 = 18;
-const SNAP_Y:      f32 = HOUR_HEIGHT / 4.0; // 15-min grid
 
 // ── Palette ──────────────────────────────────────────────────────────────────
 // RGBA tuples matching ironclad.js TYPE_COLORS and grid palette.
@@ -42,10 +41,12 @@ const TASK_BORDER: [(u8,u8,u8); 3] = [
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-/// Which week is currently visible (week view).
+/// The visible time window. All times are minutes since Unix epoch.
 pub struct ViewState {
-    /// Epoch day (since 1970-01-01) of the Monday being shown.
-    pub week_start: u16,
+    /// Start of visible window (inclusive), minutes since Unix epoch.
+    pub window_start: u32,
+    /// End of visible window (exclusive), minutes since Unix epoch.
+    pub window_end: u32,
 }
 
 pub struct Renderer {
@@ -95,7 +96,8 @@ impl Renderer {
         paint.set_color(Color::from_rgba8(GRID_QHOUR.0, GRID_QHOUR.1, GRID_QHOUR.2, 255));
         for h in 0..(END_HOUR - START_HOUR) {
             for q in 1..4_u32 {
-                let y = TOP_HEADER + h as f32 * HOUR_HEIGHT + q as f32 * SNAP_Y;
+                let snap_y = HOUR_HEIGHT / 4.0;
+                let y = TOP_HEADER + h as f32 * HOUR_HEIGHT + q as f32 * snap_y;
                 fill_rect(pixmap, &paint, LEFT_GUTTER, y, grid_right - LEFT_GUTTER, 1.0);
             }
         }
@@ -111,25 +113,31 @@ impl Renderer {
     // ── Tasks ─────────────────────────────────────────────────────────────────
 
     fn draw_tasks(&self, pixmap: &mut Pixmap, world: &World, view: &ViewState) {
-        let week_start = view.week_start as i32;
         let pad = 10.0_f32;
+        let window_day_start = view.window_start / 1440;
 
         let mut paint = Paint::default();
         paint.anti_alias = false;
 
         for task in world.tasks.values() {
-            // Skip staged tasks (no date/time) and completed tasks
-            let (date, start_time, duration) = match (task.date, task.start_time, task.duration) {
-                (Some(d), Some(s), Some(dur)) => (d as i32, s, dur),
+            // Skip staged tasks (no start/duration)
+            let (start, duration) = match (task.start, task.duration) {
+                (Some(s), Some(dur)) => (s, dur),
                 _ => continue,
             };
 
-            // Skip tasks not in the current week
-            let col = date - week_start;
-            if col < 0 || col >= DAYS as i32 { continue; }
+            // Only draw tasks that start within the visible window
+            if start < view.window_start || start >= view.window_end { continue; }
+
+            // Derive column (day) and vertical position from start
+            let epoch_day = start / 1440;
+            let col = epoch_day - window_day_start; // u32, always >= 0 after window check
+            if col >= DAYS { continue; }
+
+            let time_of_day = start % 1440; // minutes from midnight
 
             let x = LEFT_GUTTER + col as f32 * DAY_WIDTH + pad;
-            let y = TOP_HEADER + (start_time as f32 / 60.0 - START_HOUR as f32) * HOUR_HEIGHT;
+            let y = TOP_HEADER + (time_of_day as f32 / 60.0 - START_HOUR as f32) * HOUR_HEIGHT;
             let w = DAY_WIDTH - pad * 2.0;
             let h = (duration as f32 / 60.0) * HOUR_HEIGHT;
 
@@ -183,12 +191,14 @@ pub async fn render_handler(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let now_days = now_secs / 86400;
-    let dow = ((now_days + 3) % 7) as u16; // 0=Mon..6=Sun
-    let week_start = (now_days as u16).saturating_sub(dow);
+    let now_minutes = (now_secs / 60) as u32;
+    let now_day = now_minutes / 1440;
+    let dow = (now_day + 3) % 7; // 0=Mon..6=Sun
+    let window_start = (now_day - dow) * 1440; // Monday 00:00
+    let window_end   = window_start + 7 * 1440;
 
     let renderer = Renderer::new(1316, 632);
-    let view = ViewState { week_start };
+    let view = ViewState { window_start, window_end };
 
     match renderer.render_world(&world, &view) {
         Some(png) => (
@@ -207,20 +217,24 @@ mod tests {
     use crate::world::{Command, World};
     use uuid::Uuid;
 
-    fn monday_this_week() -> u16 {
-        let days = std::time::SystemTime::now()
+    /// Returns the start of the current week (Monday 00:00) in minutes since epoch.
+    fn monday_this_week_mins() -> u32 {
+        let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() / 86400;
-        let dow = ((days + 3) % 7) as u16; // (epoch_day + 3) % 7 → 0=Mon
-        (days as u16).saturating_sub(dow)
+            .as_secs();
+        let mins = (secs / 60) as u32;
+        let days = mins / 1440;
+        let dow = (days + 3) % 7; // 0=Mon..6=Sun
+        (days - dow) * 1440
     }
 
     #[test]
     fn renders_empty_world_to_png() {
         let world = World::new();
         let renderer = Renderer::new(1316, 632);
-        let view = ViewState { week_start: monday_this_week() };
+        let window_start = monday_this_week_mins();
+        let view = ViewState { window_start, window_end: window_start + 7 * 1440 };
 
         let png = renderer.render_world(&world, &view)
             .expect("render_world returned None — Pixmap allocation failed");
@@ -240,18 +254,19 @@ mod tests {
         let mut world = World::new();
         let user_id    = Uuid::new_v4();
         let service_id = Uuid::new_v4();
-        let monday     = monday_this_week();
+        let window_start = monday_this_week_mins();
+        let window_end   = window_start + 7 * 1440;
 
         // Service must exist in world before CreateTask will accept it
         world.services.insert(service_id, Service { id: service_id, name: "Test".into() });
 
         // Seed tasks across the week at different priorities
         for (col, hour, priority) in [
-            (0_u16, 9_u16,  Priority::Medium),
-            (1,     11,     Priority::High),
-            (2,     14,     Priority::Urgent),
-            (4,     10,     Priority::Low),
-            (6,     9,      Priority::Medium),
+            (0u32, 9u32,  Priority::Medium),
+            (1,    11,    Priority::High),
+            (2,    14,    Priority::Urgent),
+            (4,    10,    Priority::Low),
+            (6,    9,     Priority::Medium),
         ] {
             let _ = world.apply(
                 Command::CreateTask {
@@ -259,8 +274,7 @@ mod tests {
                     service_id,
                     priority,
                     assigned_to: None,
-                    date:        Some(monday + col),
-                    start_time:  Some(hour * 60),
+                    start:       Some(window_start + col * 1440 + hour * 60),
                     duration:    Some(60),
                 },
                 user_id,
@@ -268,7 +282,7 @@ mod tests {
         }
 
         let renderer = Renderer::new(1316, 632);
-        let view = ViewState { week_start: monday };
+        let view = ViewState { window_start, window_end };
 
         let png = renderer.render_world(&world, &view)
             .expect("render_world returned None");

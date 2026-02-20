@@ -318,8 +318,8 @@ mod tests {
         let svc_id = *world.services.keys().next().unwrap();
         let user_id = Uuid::nil();
 
-        // 2026-02-11 = epoch day 20495
-        const D: u16 = 20495;
+        // 2026-02-11 = epoch day 20495 = minute 29_512_800
+        const D: u32 = 29_512_800;
 
         // Create a task
         let event = world.apply(
@@ -328,8 +328,7 @@ mod tests {
                 service_id: svc_id,
                 priority: Priority::High,
                 assigned_to: None,
-                date: None,
-                start_time: None,
+                start: None,
                 duration: None,
             },
             user_id,
@@ -345,8 +344,7 @@ mod tests {
         let event = world.apply(
             Command::ScheduleTask {
                 task_id,
-                date: D,
-                start_time: 540,
+                start: D + 540, // 9:00 AM
                 duration: 60,
             },
             user_id,
@@ -361,8 +359,7 @@ mod tests {
         let task = &world2.tasks[&task_id];
         assert_eq!(task.title, "Test task");
         assert_eq!(task.status, crate::world::TaskStatus::Scheduled);
-        assert_eq!(task.date, Some(D));
-        assert_eq!(task.start_time, Some(540));
+        assert_eq!(task.start, Some(D + 540));
         assert_eq!(task.duration, Some(60));
 
         cleanup(&path);
@@ -383,8 +380,7 @@ mod tests {
                 service_id: svc_id,
                 priority: Priority::Low,
                 assigned_to: None,
-                date: None,
-                start_time: None,
+                start: None,
                 duration: None,
             },
             Uuid::nil(),
