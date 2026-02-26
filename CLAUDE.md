@@ -4,117 +4,135 @@
 Multiplayer Online) — 5-20 users on software-rendered VDI desktops with no GPU
 and bandwidth-constrained codec connections.
 
-**Who built this:** Ulli (darxtarr) with rotating Mentat partners (Claude
-instances — Opus and Sonnet). Multi-session, multi-model collaboration.
+**Who built this:** Ulli (darxtarr) with rotating AI partners (Claude, GPT,
+Gemini). Multi-session, multi-model collaboration.
 
-**Important framing:** DESIGN.md is the output of brainstorming sessions, not
-proven production truth. Every hypothesis needs testing on real CloudPC
-hardware. If you can prove something wrong, that's a win.
+**Important framing:** DESIGN.md is the output of research and brainstorming
+sessions, not proven production truth. Every hypothesis needs testing on real
+CloudPC hardware. If you can prove something wrong, that's a win.
 
 ## Before You Do Anything
 
-**Read DESIGN.md.** The entire document. It explains:
-- Why every architectural decision was made
-- The VDI constraints that drive everything
-- The pit stop interaction model
-- What the browser does (almost nothing) and why
+1. **Read CURRENT_STATE.md.** It tells you what phase we're in and what to
+   build next.
+2. **Read DESIGN.md.** The entire document. It explains every architectural
+   decision and the constraints that drive them.
+3. **Look at `flashlight-overlay.png`.** That sketch is the visual spec for
+   the current phase.
 
-The axiom is: **"Everything is possible but nothing is real until the click."**
+The axiom: **"Everything is possible but nothing is real until the click."**
 If you don't understand what this means after reading DESIGN.md, ask Ulli
 before writing code.
 
 ## Architecture (60-second version)
 
 ```
-Browser (IRONCLAD)  →  just glass. Displays one image. Tracks mouse.
-         ↕ localhost WebSocket
-Rust sidecar        →  brain. Renders world to image. Owns hit testing.
-         ↕ WAN WebSocket
-EC2                 →  memory. Relays mutations. Stores artifacts.
+[User laptop] ── VDI/WAN (variable quality) ──► [Azure CloudPC]
+                                                  │  localhost
+                                             [IRONCLAD] ◄──WS──► [Sidecar]
+                                                  │
+                                               WAN (corporate)
+                                                  │
+                                             [AWS EC2 Ireland]
 ```
 
 The browser does NOT render world state. The browser does NOT do hit testing.
 The browser does NOT own state. The sidecar does all of this and sends the
-browser a flat image to display. One div materializes on click. Zero divs at
-rest.
+browser a flat image to display.
 
-Spatial queries use the **SDF flashlight** — a fixed-radius circle of signed
-distance field evaluations around the cursor. All interactable elements (tasks,
-buttons, panels, drop zones) are SDFs. The sidecar pushes the candidate list
-to the browser, which can materialize instantly on click without a round-trip.
-Elements within the flashlight radius get a proximity glow (canvas overlay) —
-this is a VDI heartbeat, continuous proof that the system is alive.
+The sidecar also sends **OverlayCommands (0x1A)** — draw commands for the
+flashlight overlay (clipped element edges). The browser executes these on an
+SVG overlay. This is UX only, independent of the candidate list (which is for
+click semantics). Same SDF pass, two separate outputs.
 
-## What NOT To Do
+## Current Phase: Flashlight Overlay Stress Test
 
-**Do not add a JS framework.** No React, no Vue, no Svelte. The browser is
-glass — it displays an image and tracks a mouse. You do not need a component
-tree for that.
+**Read CURRENT_STATE.md for the full spec.** Short version:
 
-**Do not add canvas rendering of world state.** The canvas-era code in
-ironclad.js v0.8 is legacy. The sidecar renders; the browser displays.
-Rendering in two places creates divergence. (A small canvas overlay for cursor
-glow and proximity highlights IS part of the design — that's local feedback,
-not world rendering.)
+We are building a browser-only testbed that proves the flashlight overlay
+works on real CloudPC/VDI hardware. Three files in `frontend/`: index.html,
+styles.css, ironclad.js. No server needed.
 
-**Do not auto-generate task titles.** Email subjects are terrible task names.
-Drops create tasks with empty titles and immediately open editing. The human
-types the title. This is a deliberate design decision born from NOC
-operational experience.
+The test harness generates random shapes, bakes them as a background image,
+then on every cursor move: evaluates SDF for all shapes, clips their edges to
+the flashlight circle, and feeds draw commands to the overlay module. The
+overlay module draws clipped edge fragments as green SVG lines.
+
+This is a stress test. We push shape count (10 → 2000) and overlap density
+until performance degrades, find the ceiling, and use that data to decide
+what comes next.
+
+**What to build:**
+- Overlay module (production quality — survives into final IRONCLAD)
+- Test harness (throwaway — replaced by Rust sidecar later)
+
+**What NOT to build yet:**
+- Materialization module (mousedown → div). Comes after overlay is proven.
+- Anything in `backend/src/`. Sidecar waits for testbed results.
+- Wire protocol. The harness feeds the overlay module directly via JS objects.
+
+## What NOT To Do (ever)
+
+**Do not add a JS framework.** No React, no Vue, no Svelte.
+
+**Do not render world state in the browser.** The sidecar renders; the browser
+displays. The SVG overlay for flashlight feedback IS part of the design —
+that's local UX, not world state.
+
+**Do not auto-generate task titles.** Drops create tasks with empty titles and
+immediately open editing. The human types the title.
 
 **Do not try to eliminate the "flash" on background swap.** It's intentional
 tactile feedback. See DESIGN.md "The Flash Is a Feature."
 
-**Do not add source metadata to tasks** (source: Email, source: Manual, etc.).
-The task exists because there's a problem. How it arrived is trivia. The
-email is an artifact (attachment), not a task property.
+**Do not add source metadata to tasks** (source: Email, etc.).
 
-**Do not propose CRDT, event sourcing, or protocol versioning.** These are
-explicitly rejected in DESIGN.md with reasoning. Read the reasoning before
-re-proposing.
+**Do not propose CRDT, event sourcing, or protocol versioning.** Explicitly
+rejected in DESIGN.md with reasoning.
 
-## What's Solid (don't rewrite)
+**Do not shoehorn old source code into the new architecture.** The archive is
+reference material for patterns. Do not copy files back. Write everything new.
 
-- `world.rs` — pure state machine, 21 tests, the core
-- `wire.rs` — binary protocol, 12 tests, proven
-- `persist.rs` — redb ACID persistence, 4 tests
-- `game.rs` — WebSocket handler with subscribe-before-snapshot
+## Source Code Status
 
-## What's Transitional (being replaced)
+**Clean slate.** `backend/src/` is empty. `frontend/` is being rewritten for
+the testbed (index.html, styles.css, ironclad.js — all fresh).
 
-- `ironclad.js` v0.8 — canvas rendering era. Wire protocol and interaction
-  logic are portable. Canvas drawing code is not.
-- `renderer.rs` — proof of concept (tiny-skia works). Needs viewport
-  negotiation, chrome layer caching, and wiring into game.rs.
+The archive (`archive/backend-pre-axiom/`, `archive/frontend-pre-axiom/`)
+exists for reference:
+- redb patterns (`archive/backend-pre-axiom/src/persist.rs`)
+- tiny-skia draw primitives (`archive/backend-pre-axiom/src/renderer.rs`)
+- Axum WebSocket handler (`archive/backend-pre-axiom/src/game.rs`)
+- State machine patterns (`archive/backend-pre-axiom/src/world.rs`)
+- Previous IRONCLAD engine (`archive/frontend-pre-axiom/ironclad.js`)
 
-## What's Next
+## Build Order
 
-The sidecar image pipeline: renderer.rs → game.rs → new IRONCLAD. See the
-"What's next" section at the end of DESIGN.md for the ordered task list.
+**Testbed first.** Then the formal stack, only after the testbed passes on
+real hardware. See CURRENT_STATE.md for the full sequence.
 
 ## Tools & Build
 
 ```bash
+# Testbed phase — no server needed
+# Open frontend/index.html directly in a browser
+
+# After testbed passes:
 cd backend && cargo build          # Build sidecar
-cd backend && cargo test           # Run all tests (37 tests)
+cd backend && cargo test           # Run all tests
 cd backend && cargo run            # Start on :3000, serves frontend/
 ```
 
-Frontend has no build step. `frontend/index.html` + `frontend/ironclad.js` +
-`frontend/styles.css`. Served as static files.
+Frontend has no build step. Static files only.
 
 ## Key Files
 
-| File | What | Lines |
-|------|------|-------|
-| `DESIGN.md` | Source of truth — read this first | ~700 |
-| `INTERACTIONS.md` | Gesture design decisions | ~110 |
-| `KEYBINDS.md` | Active and planned keybinds | ~45 |
-| `backend/src/world.rs` | Pure state machine | ~780 |
-| `backend/src/wire.rs` | Binary wire protocol | ~590 |
-| `backend/src/persist.rs` | redb persistence | ~410 |
-| `backend/src/game.rs` | WebSocket game handler | ~120 |
-| `backend/src/renderer.rs` | tiny-skia renderer (PoC) | ~280 |
-| `backend/src/auth.rs` | JWT + Argon2 (dev mode) | ~130 |
-| `backend/src/main.rs` | Boot sequence | ~90 |
-| `frontend/ironclad.js` | Canvas-era frontend (v0.8) | ~1230 |
+| File | What |
+|------|------|
+| `DESIGN.md` | Architecture source of truth — read first |
+| `CURRENT_STATE.md` | Where we are, what to build next |
+| `KEYBINDS.md` | Active and planned keybinds |
+| `flashlight-overlay.png` | Visual spec for flashlight overlay |
+| `frontend/` | IRONCLAD — testbed in progress |
+| `backend/src/` | Sidecar — empty until testbed passes |
+| `archive/` | Previous versions — reference only |

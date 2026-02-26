@@ -3,66 +3,90 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IRONCLAD v0.8 — txxt</title>
+    <title>IRONCLAD — Flashlight Overlay Stress Test</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <header id="controls">
-        <span class="title">IRONCLAD v0.8</span>
+        <span class="title">IRONCLAD STRESS TEST</span>
 
         <label>
-            Flashlight <output id="flash-val">150</output>px
-            <input type="range" id="flash-slider" min="20" max="500" step="10" value="150">
+            Radius <output id="radius-val">120</output>px
+            <input type="range" id="radius-slider" min="20" max="500" step="5" value="120">
         </label>
 
-        <span class="hint" id="status">Connecting...</span>
+        <label>
+            Shapes <output id="shape-val">50</output>
+            <input type="range" id="shape-slider" min="10" max="2000" step="10" value="50">
+        </label>
 
-        <button id="test-mode" style="margin-left:auto;font-size:11px;opacity:0.5">Test (500 random)</button>
+        <label>
+            Density <output id="density-val">3</output>
+            <input type="range" id="density-slider" min="1" max="10" step="1" value="3">
+        </label>
+
+        <label>
+            <input type="checkbox" id="show-circle" checked>
+            Show circle
+        </label>
+
+        <button id="regenerate">Regenerate</button>
     </header>
 
-    <main id="engine-container"></main>
+    <main id="engine-container">
+        <div id="perf"></div>
+    </main>
 
-    <script src="ironclad.js?v=8"></script>
+    <script src="ironclad.js"></script>
     <script>
-        const engine = new IroncladEngine('engine-container');
-        const statusEl = document.getElementById('status');
+        const harness = new TestHarness('engine-container');
 
-        // Connect to game server
-        const wsUrl = 'ws://' + location.hostname + ':3000/api/game';
-        engine.connect(wsUrl);
+        // Read initial control values
+        const radiusSlider = document.getElementById('radius-slider');
+        const radiusVal = document.getElementById('radius-val');
+        const shapeSlider = document.getElementById('shape-slider');
+        const shapeVal = document.getElementById('shape-val');
+        const densitySlider = document.getElementById('density-slider');
+        const densityVal = document.getElementById('density-val');
+        const showCircle = document.getElementById('show-circle');
+        const regenBtn = document.getElementById('regenerate');
 
-        // Update status indicator
-        setInterval(() => {
-            if (engine.connected) {
-                statusEl.textContent = 'Connected | rev ' + engine.revision + ' | ' + engine.count + ' tasks on grid';
-            } else {
-                statusEl.textContent = 'Disconnected — reconnecting...';
-            }
-        }, 500);
+        function regen() {
+            harness.regenerate(
+                parseInt(shapeSlider.value),
+                parseInt(densitySlider.value)
+            );
+        }
 
-        // Flashlight slider
-        const fSlider = document.getElementById('flash-slider');
-        const fVal    = document.getElementById('flash-val');
-        fSlider.addEventListener('input', () => {
-            const r = parseInt(fSlider.value);
-            fVal.textContent = r;
-            engine.setFlashlightRadius(r);
+        // Initial generation
+        regen();
+
+        // Flashlight radius
+        radiusSlider.addEventListener('input', () => {
+            const v = parseInt(radiusSlider.value);
+            radiusVal.textContent = v;
+            harness.setFlashlightRadius(v);
         });
 
-        // Keyboard shortcuts are handled by the engine (_bindInput)
-        // so they're always global and view-independent.
-
-        // Test mode fallback (generates random data, no server)
-        document.getElementById('test-mode').addEventListener('click', () => {
-            if (engine.ws_conn) {
-                engine.ws_conn.onclose = null; // prevent reconnect
-                engine.ws_conn.close();
-                engine.ws_conn = null;
-                engine.connected = false;
-            }
-            engine._generate(500);
-            statusEl.textContent = 'Test mode (500 random entities)';
+        // Shape count — regenerate on change
+        shapeSlider.addEventListener('input', () => {
+            shapeVal.textContent = shapeSlider.value;
+            regen();
         });
+
+        // Overlap density — regenerate on change
+        densitySlider.addEventListener('input', () => {
+            densityVal.textContent = densitySlider.value;
+            regen();
+        });
+
+        // Show flashlight circle toggle
+        showCircle.addEventListener('change', () => {
+            harness.setShowCircle(showCircle.checked);
+        });
+
+        // Regenerate button
+        regenBtn.addEventListener('click', regen);
     </script>
 </body>
 </html>

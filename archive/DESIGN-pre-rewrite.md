@@ -1,79 +1,21 @@
 # txxt — Design Document
 
-*Last updated: 2026-02-26.*
+Updated 2026-02-20. This is the source of truth for architectural decisions.
 
-If you are a new session arriving at this codebase: read this entire document
+If you are a new instance arriving at this codebase: read this entire document
 before writing a single line of code. Then understand what it IS and what it
 ISN'T:
 
-**This document is the output of research and brainstorming sessions.** It
-represents the best thinking of the humans and models who have worked on this
-project. It is NOT proven in production. It is NOT the final word. Every
-hypothesis here needs to be tested on real CloudPC hardware with real users.
-Some ideas will float. Some will sink. That is the point — we documented the
-reasoning so you can test it, challenge it, and improve it.
+**This document is the output of a brainstorming session.** It represents the
+best thinking of the humans and models who have worked on this project. It is
+NOT proven in production. It is NOT the final word. Every hypothesis here needs
+to be tested on real CloudPC hardware with real users. Some ideas will float.
+Some will sink. That is the point — we documented the reasoning so you can
+test it, challenge it, and improve it.
 
 If you disagree with something, say so — but understand *why* it exists before
 proposing an alternative. If you can prove something wrong on real hardware,
 that's a win, not a failure.
-
----
-
-## What This Actually Is
-
-There is a class of software problem where the standard approach doesn't just
-underperform — it actively makes things worse. txxt lives in that class.
-
-The standard approach to a collaborative scheduling tool is: a frontend
-framework, a REST API, a database, a canvas or DOM calendar. This works fine
-on a developer's MacBook. On a CloudPC — a GPU-less Windows VM accessed through
-a VDI codec over a marginal corporate WAN — it produces something unusable.
-Every canvas redraw tells the VDI codec that the entire viewport changed. The
-codec compresses a full frame. The WAN ships it. On a marginal link (and
-corporate links are always marginal), the user sees lag, artifacts, dropped
-frames. The tool that was supposed to help them work faster makes them slower.
-
-So the starting point for txxt is not "how do we build a scheduling tool" but
-"what does a scheduling tool look like if you design it *for* these constraints
-from first principles, without assuming any of the usual stack?"
-
-The technically correct answers — WASM with shader access, a custom native GUI,
-a lightweight rendering engine — are blocked. Not by capability, but by ISRM.
-Enterprise IT has a formal approval process for custom applications. It takes
-months, sometimes never completes, and produces a result that is already
-outdated. The browser is the only approved runtime, because IT already manages
-it, patches it, and monitors it. So the browser is pinned. That's the wall.
-
-The sidecar is citizen development. It's a helper application that an ops team
-can install themselves — git clone from a public repo, cargo build, run. No IT
-procurement. No security review cycle. It exists in the practical gap between
-what IT mandates (browser only) and what a small technical ops team can quietly
-run. This framing matters: the sidecar must remain something ops can deploy and
-maintain themselves, not something that requires IT involvement every time a
-change ships.
-
-The answer to the wall turns out to be something closer to a game server with a
-thin terminal client than anything recognizable as a web app. The browser is
-demoted to a dumb display. Rendering moves to the sidecar, which runs on the
-same CloudPC as the browser — localhost, not another WAN hop. The interaction
-model is rebuilt from physics — specifically, from the observation that humans
-decelerate before clicking, which means there is always a window of time to
-pre-compute the answer to a question that hasn't been asked yet.
-
-That last insight is the intellectual core of this project. Everything else
-follows from it.
-
-The users are concierge tech support for an enterprise. They manage CloudPC
-environments, handle tickets, coordinate with developers, juggle simultaneous
-requests. They're on calls, getting interrupted by colleagues, context-switching
-between incidents. They glance at the schedule, grab a task, drop it in a time
-slot, and go back to the actual work. The tool needs to be fast, obvious, and
-impossible to use wrong under stress.
-
-The operational instincts informing this design — task titling, the wrong-task
-problem, visual distinction under pressure — come from Ulli's decade of NOC
-experience. The deployment context is enterprise tech support, but the design
-principles are battle-tested in higher-pressure environments.
 
 ---
 
@@ -112,25 +54,17 @@ behavior. HTML5 Drag and Drop API available. No exotic browser constraints.
 thousand concurrent connections. But all users are working the same schedule
 simultaneously — when User A moves a task, Users B through F need to see it.
 
-**Two WAN hops.** The user sits at a laptop or thin client and connects to
-their CloudPC via VDI (RDP/Citrix/Blast). That link quality varies enormously:
-enterprise fiber, home DSL, 4G, 5G, FWA, LEO satellite — design for the worst
-case. The VDI codec compresses the CloudPC's screen and ships it over this link.
-Link quality IS user experience quality. There is a second WAN hop from the
-CloudPC (Azure) to the coordination server (AWS, Ireland). This runs over a
-managed corporate interconnect — more predictable than the user's VDI link, but
-not immune. Peak-hour US morning boot storms (thousands of CloudPCs booting plus
-OneDrive syncing simultaneously) cause Azure/AWS interconnect congestion for EU
-users for a couple of hours each day.
+**The users are concierge tech support for an enterprise.** They manage
+CloudPC environments, handle tickets, coordinate with developers, and juggle
+simultaneous requests. They're on calls, getting interrupted by colleagues,
+context-switching between incidents. They glance at the schedule, grab a task,
+drop it in a time slot, and go back to the actual work. The scheduling tool
+needs to be fast, obvious, and impossible to use wrong under stress.
 
-**The CloudPC is already overloaded.** At rest, without txxt running, a
-CloudPC is typically at 70% CPU and similar memory pressure. Security tooling
-runs continuously: Zscaler (network proxy), Avecto/BeyondTrust (privilege
-management), TrendMicro (endpoint protection) — all real-time scanning
-everything. Add Teams, Outlook, and the VDI client itself. The txxt sidecar
-competes for CPU on an already-saturated machine. This is not a background
-concern; it directly constrains renderer complexity, render frequency, and
-candidate list computation budget.
+(The operational instincts informing this design — task titling, the wrong-task
+problem, visual distinction under pressure — come from Ulli's decade of NOC
+experience. The deployment context is enterprise tech support, but the design
+principles are battle-tested in higher-pressure environments.)
 
 ---
 
@@ -163,48 +97,35 @@ If you are about to `npm install` anything, stop. Read this section again.
 ## Topology
 
 ```
-[User laptop or thin client]
-     │
-     │  VDI over WAN — the critical link
-     │  Quality: 4G/5G, FWA, home DSL, office fiber — anything.
-     │  Design for worst case. The entire experience rides on this.
-     │
-     ▼
-[Azure CloudPC — Windows 11 VM, no GPU, ~70% CPU/RAM at rest]
-┌──────────────────────────────────────────────────────────┐
-│  Chromium browser (IRONCLAD)                              │
-│  — displays one flat background image                     │
-│  — tracks mouse, forwards raw events                      │
-│  — materializes exactly one div on click                  │
-│  — dematerializes it on mouseup                           │
-│          ↕ WebSocket (localhost — not a network hop)      │
-│  Rust sidecar (one binary per CloudPC)                    │
-│  — owns world state in memory + redb save file            │
-│  — renders world to image (software 2D, tiny-skia)        │
-│  — runs spatial query, maintains candidate list            │
-│  — knows what is under the cursor at all times            │
-│  — translates pixel coords → world time values            │
-│  — on click: confirms, triggers div materialization       │
-│  — on drop: mutates world, re-renders, sends image        │
-└──────────────────────────────────────────────────────────┘
-     │
-     │  WAN — Azure → AWS Ireland (corporate managed link)
-     │  More reliable than VDI. Still has hiccups (peak-hour
-     │  US boot storms → EU interconnect congestion).
-     │
-     ▼
-[AWS EC2 Ireland — T3 large, persistent server]
-— receives state mutations from all sidecars
-— broadcasts mutations to all other connected sidecars
-— persists canonical world state (database TBD)
+CloudPC (one per user, no GPU, software-rendered VDI)
+┌─────────────────────────────────────────────────────┐
+│  IRONCLAD (browser)                                  │
+│  — displays one flat background image               │
+│  — tracks mouse, forwards raw events                │
+│  — materializes exactly one div on click            │
+│  — dematerializes it on mouseup                     │
+│         ↕ WebSocket (localhost or fast LAN)          │
+│  Rust sidecar (one binary per CloudPC)              │
+│  — owns world state in memory                       │
+│  — renders world to image (software 2D, tiny-skia)  │
+│  — runs spatial query, maintains candidate list      │
+│  — knows what is under the cursor at all times      │
+│  — on click: confirms, triggers div materialization  │
+│  — on drop: mutates world, re-renders, sends image  │
+└─────────────────────────────────────────────────────┘
+         ↕ WebSocket (WAN)
+EC2 central server (one instance)
+— receives state mutations from sidecars
+— broadcasts mutations to all other sidecars
+— persists canonical world state (redb)
 — stores shared artifacts (email attachments, files)
 — resyncs sidecars that were offline or crashed
 ```
 
 ### Why one sidecar per CloudPC?
 
-CloudPCs have no GPU. All rendering is software on the CloudPC CPU. Hit testing,
-spatial queries, image generation — all of this must happen on the CloudPC to be fast.
+CloudPCs have no GPU. All rendering is software on the local CPU. Hit testing,
+spatial queries, image generation — all of this must happen locally to be fast.
 A round trip to EC2 for hit testing would add 20-100ms of latency on every
 mouse movement. Unacceptable for a tool where the interaction model is
 drag-and-drop.
@@ -311,13 +232,13 @@ DRAG:
 
 ```
 MOUSEUP:
-  Browser sends final pixel position + task_id to sidecar
-  Sidecar: converts pixels → start/duration, validates, mutates world, increments revision
+  Browser sends final position + task_id to sidecar
+  Sidecar: validates position, mutates world state, increments revision
   Sidecar: re-renders world to image
   Sidecar → browser: new background image
   Browser: removes div, sets new background
   *snap* — the satisfying click of a tactile switch (see "The Flash")
-  Sidecar → EC2: mutation event (time-based — sidecar has already translated)
+  Sidecar → EC2: mutation event
   EC2 → other sidecars: broadcast
   Other browsers: receive new background image, see the change
 ```
@@ -332,7 +253,7 @@ The current proposal is the **SDF flashlight** — evaluate signed distance
 fields for all elements within a radius around the cursor. But SDFs are not
 the only tool. Multiple mathematical approaches exist, and the right answer
 might be a combination. This section documents the landscape so future
-sessions can evaluate, test, and improve.
+instances can evaluate, test, and improve.
 
 **Important:** The SDF flashlight was proposed because Ulli knows and
 understands SDFs. It is a good starting point, not a proven optimal. If
@@ -571,150 +492,39 @@ Three reasons:
 
 ---
 
-## Proximity Glow — The Flashlight Overlay
+## Proximity Glow — The VDI Heartbeat
 
-### The design: invisible until needed
+### The problem: VDI kills tactile feedback
 
-The overlay is invisible in empty space. The cursor is just a cursor. The
-screen is static. The VDI codec sleeps.
+On a remote desktop, there is no tactile feedback. When everything freezes —
+and on VDI, things freeze regularly — the user cannot distinguish between:
+- "The connection dropped"
+- "The app froze"
+- "The PC froze"
+- "The system is processing my last action"
 
-When the cursor approaches an interactable element, the geometry of that
-element is revealed — not by re-rendering it (it is already baked into the
-background image), but by projecting a flashlight onto it. The background is
-the slide. The SVG/canvas overlay is the projector. The projector shines only
-within the flashlight radius, revealing the outlines of whatever the sidecar
-already placed there.
+This creates a constant low-grade anxiety. Did my click register? Should I
+click again (risking a double-action)? Should I wait (wasting time if the
+connection actually dropped)? There is no way to know. The screen just... sits
+there.
 
-In empty space: the flashlight circle is mathematically present but visually
-absent — no stroke, no fill, nothing. Near an element: the intersection of
-the flashlight circle and the element's boundary becomes visible. An arc
-appears at a corner. An edge segment lights up. The element acknowledges the
-cursor through pure geometry. Nothing is drawn that was not already there
-underneath; it is just illuminated.
+The proximity glow is a **continuous proof of life**. The world visibly
+responds to cursor movement. Elements react when the cursor approaches. The
+user sees: "The system is here. My connection is alive. My next click will
+work." This eliminates the uncertainty that makes VDI users tentative and slow.
 
-This is also how users discover what is interactive. Sweep the cursor across
-the scene. Elements respond when the beam hits them. No tooltips, no hover
-labels, no manual. The layout reveals itself through exploration — the same
-instinct that made LucasArts adventure games immediately legible to anyone
-who had never played one.
+### The mental model: adventure games
 
-### The liveness signal (emergent, not a status widget)
+Think of LucasArts adventure games (Monkey Island, Day of the Tentacle). You
+enter a room. You sweep the cursor across the scene. Interactable objects
+light up — a door, a key, a lever. You're mapping the interactive topology
+of the scene through cursor exploration. You don't need a manual or a label.
+The scene TELLS you what's interactive by responding to proximity.
 
-This is the answer to the VDI user's constant background anxiety: is my
-session alive right now, or did something break while the screen sat still?
-
-The cursor moves instantly — it is local to the VDI client, never encoded
-in the video stream. The flashlight overlay moves when the browser processes
-the mousemove, renders to the SVG, and the VDI codec delivers the result to
-the user's screen. That full loop — input through browser through codec to
-screen — is the session health check. When everything is fine, cursor and
-flashlight feel fused. When there is a lag spike, the cursor slides ahead
-and the flashlight catches up with a visible delay. When the session is dead,
-the flashlight freezes while the cursor keeps moving.
-
-The signal is emergent. When something feels wrong, users naturally start
-moving the mouse more — sweeping across the screen, trying to provoke a
-response. They inevitably pass near elements. If the flashlight reacts: alive,
-maybe slow. If it does not react at all: broken. No ping counter, no
-connection status icon. The lag is visible in the physics of the thing itself.
-
-### Implementation: sidecar computes, browser draws
-
-The goal is simple: make the user aware that nearby elements exist, and that
-the system is alive and tracking. How to achieve that visually is an open
-question to be settled by testing on real CloudPC hardware under real VDI
-conditions. Two approaches are on the table.
-
-**Approach 1 — Cel shader (clipped element edges):**
-The flashlight is a circular clip region. For every element whose boundary
-passes through it, clip that element's edges to the circle interior and draw
-only the clipped fragments. The result follows element geometry exactly —
-like a torch illuminating the surfaces it hits, the way cel shaders draw
-object outlines. Clean, spatially accurate, strongly tied to the actual
-element positions in the background image.
-
-**Approach 2 — Flashlight arcs (intersection markers on the circle):**
-Draw arcs of the flashlight circle itself at the points where it crosses
-element boundaries. As the cursor approaches an element, arcs appear on the
-circle rim at the contact points and sweep inward as distance decreases.
-The visual is more abstract — not "here is the element edge" but "the beam
-is touching something in that direction."
-
-**The VDI lag tradeoff:**
-Both approaches suffer under lag, but differently. With clipped edges, a
-lag spike means the highlights are drawn for the cursor's old position —
-the green lines appear at element boundaries, but at the wrong clip offset.
-Since the element itself is static in the background, this looks like the
-highlights are slightly displaced or lingering. With flashlight arcs, a lag
-spike means the arc angles correspond to the old cursor position — the arcs
-point in a direction the cursor has already left. Both are readable as "the
-system is catching up." Which one feels better or becomes confusing first
-is an empirical question.
-
-What gets drawn: the portions of element edges that fall inside the
-flashlight circle. Straight lines for rectangular tasks (clipped rectangle
-edges), arcs for circular elements (clipped arc segments). Not the full
-outline of any element. Not the outline of the flashlight circle itself.
-Just the lit edges — the places where the flashlight beam hits a surface.
-
-```
-Flashlight circle (invisible)
-    ↓
-For each element within radius:
-    clip element boundary segments to circle interior
-    → short line/arc draw commands, a few dozen pixels each
-    → nothing outside the circle, nothing for empty space
-```
-
-The sidecar owns the geometry. When the browser sends a cursor update:
-1. SDF pass: which elements are within flashlight radius?
-2. For each: clip boundary to circle interior → draw commands
-3. Send `0x1A OverlayCommands` to browser
-4. Browser executes on SVG overlay. That is all.
-
-No element geometry lives in the browser. No invisible layer of shapes
-waiting to be revealed. The only pixels that change are the clipped edges,
-a handful per frame, only when the flashlight moves near something.
-
-### Shape boundary decomposition
-
-The sidecar only needs two intersection primitives: **circle ∩ line segment**
-and **circle ∩ arc**. Every shape boundary in the application decomposes into
-exactly these two types before any clipping is computed. This is not a
-limitation — it is the complete set:
-
-- **Rectangles** (task cards) → four axis-aligned line segments
-- **Rounded rectangles** → four line segments + four quarter-circle arcs at
-  corners
-- **Circles** (buttons, indicators) → a single arc
-- **Arbitrary polygons** → N line segments
-- **Bézier curves** → sampled into a polyline of short line segments. At VDI
-  resolution and codec compression, a 12-segment approximation of a smooth
-  curve is visually indistinguishable from the true curve.
-
-The sidecar knows this decomposition without additional work because it
-constructed the shapes programmatically before rendering them. The boundary
-representation is the inverse of the draw commands: whatever geometry was
-passed to tiny-skia is stored alongside as a list of primitives. Nothing is
-reverse-engineered from the image.
-
-The browser receives only the clipped output — short segments and arc fragments
-— and has no knowledge of the original shape, how many primitives it consisted
-of, or what its full boundary looks like. To the browser, a rounded rectangle
-and a circle produce the same thing: a batch of draw commands to execute.
-
-### The mousedown transition
-
-When the user presses mousedown on an element that is currently highlighted:
-
-1. Overlay clears immediately — all green edges disappear
-2. The element materializes as a div (already pre-hydrated in the candidate
-   list, zero latency, zero computation)
-3. Interaction begins — drag, resize, or click-to-edit
-
-The visual snap from "cel-shaded outline" to "live interactive div" is
-instant because the pit crew was already in position. The highlighting was
-the pre-computation phase made visible. The click is just the trigger.
+txxt works the same way. The SDF flashlight sweeps with the cursor. Elements
+within range respond visually. The user discovers what's interactive by
+moving the mouse. No tooltips needed. No hover states in the traditional
+CSS sense. The world itself communicates.
 
 ### The constraint that makes this possible
 
@@ -810,62 +620,11 @@ a full border. If the cursor glow color change is enough, don't draw anything
 on the element at all. Test the cheapest approach first, escalate only if it
 doesn't communicate clearly through the VDI codec.
 
-No shaders. Zero GPU acceleration means all overlay drawing happens on the CPU.
-The math (SDF evaluation, circle-boundary intersection) is cheap arithmetic.
-The drawing is cheap SVG attribute updates. The expensive part is always the
+No shaders. Zero GPU acceleration means all overlay drawing is canvas 2D
+context on the CPU. Keep it simple: `fillRect`, `arc`, `moveTo`/`lineTo`.
+The math (SDF evaluation, circle-rectangle intersection) is cheap arithmetic.
+The drawing is cheap canvas primitives. The expensive part is always the
 codec — minimize dirty pixels, maximize visual information.
-
-### Overlay rendering: SVG, not canvas
-
-The overlay is implemented as an SVG layer, not a `<canvas>` element. Canvas
-is the reflexive choice — it is what most people reach for when doing 2D
-drawing in a browser. SVG is the right choice here, for reasons that are
-specific to the CloudPC VDI context and would not necessarily apply elsewhere.
-
-**Dirty region tracking.** The VDI codec only transmits pixels that changed.
-With canvas you manage dirty regions yourself: `clearRect` over the old
-flashlight position, draw the new fragments. Done carefully this works, but
-"done carefully" means computing the bounding union of old and new positions
-and calling clearRect on approximately the right area. Chromium's SVG renderer
-tracks exactly which pixels changed per element — it knows the precise bounding
-box before and after each attribute change, and invalidates exactly that
-region. This is Chromium doing what it was designed to do, correctly, without
-any help from application code.
-
-**Smooth transitions, free.** When a shape enters the flashlight radius its
-edge fragment should fade in rather than pop. When it leaves, it should fade
-out. A hard pop — many pixels changing state in a single frame — is the
-codec's worst case: it must encode a burst of dirty pixels all at once. A
-smooth fade distributes the same information across several frames, each
-with fewer dirty pixels per frame. On SVG elements this is
-`transition: opacity 80ms ease-out` in CSS. The browser compositor handles
-it. On canvas you would write an easing loop, track per-element fade state,
-and schedule requestAnimationFrame yourself. The SVG approach costs nothing;
-the canvas approach costs code, CPU, and more complex state management.
-
-**Filter API.** SVG filters (`feGaussianBlur`, `feColorMatrix`) are available
-if soft glow on overlay elements turns out to communicate better through codec
-compression than hard-edged lines. **Caveat: SVG filters run on the CPU on
-GPU-less machines.** Test on real CloudPC hardware before committing to any
-filter. A blur that looks elegant on a developer machine may cost more CPU
-than it is worth on a CloudPC already running at 70% load. The capability is
-there; whether it earns its keep is an empirical question.
-
-**DOM cost at this scale is not a concern.** The anxiety about SVG in
-performance-sensitive contexts usually involves thousands of nodes — complex
-data visualisations, large diagrams. The flashlight overlay at any moment has
-at most 5-15 elements: fragments from whichever shapes happen to fall within
-the flashlight radius. Updating `x1`/`y1`/`x2`/`y2` on a `<line>` element
-triggers no layout recalculation. It is an attribute write with a bounded
-repaint. There is nothing to worry about here.
-
-**The pool pattern — never create or destroy elements per frame.** Allocate a
-fixed pool at startup: 20 `<line>` elements and 8 `<path>` elements covers
-any realistic scenario. Reuse them. When a frame needs 7 segments, show 7
-pool elements and hide the rest (`display: none` has zero repaint cost on
-hidden elements). When the cursor is in empty space and needs 0 segments, hide
-all of them. GC pressure is zero. Frame cost is purely the attribute writes
-for visible elements.
 
 ### The two-tier feedback model (hypothesis to test)
 
@@ -914,7 +673,7 @@ The materialized div renders text with CSS. They look slightly different. Nobody
 cares, because the div exists for 1-3 seconds during a drag operation, and the
 flash on drop tells you the operation is complete.
 
-Do not try to make the swap seamless. If a future session spends tokens
+Do not try to make the swap seamless. If a future instance spends tokens
 on sub-frame synchronization, they have missed the point.
 
 ---
@@ -936,11 +695,11 @@ broadcast. The background image itself may be stale.
 ```
 ON VISIBILITY CHANGE (hidden → visible):
   Browser: mark candidate cache STALE
-  Browser → sidecar: VisibilityChange(visible=true, last_seen_revision)
+  Browser → sidecar: "I'm back" message with last_seen_revision
 
   Sidecar checks revision gap:
-    Small gap → send missed event deltas → re-render
-    Large gap → send fresh snapshot → full re-render
+    Small gap → send missed event deltas
+    Large gap → send fresh snapshot
   Sidecar sends current background image
   Browser: swaps background, clears candidate cache
 
@@ -950,8 +709,8 @@ ON FIRST MOUSEMOVE (after resync):
 
 ON CLICK WITH STALE CACHE (user clicks before moving mouse):
   Browser: cache is stale, DON'T materialize locally
-  Browser → sidecar: ClickAt (reactive fallback)
-  Sidecar: computes candidate from scratch, responds with CandidateList
+  Browser → sidecar: click coordinates (reactive fallback)
+  Sidecar: computes candidate from scratch, responds with bounds
   Browser: materializes (~1ms later on localhost, imperceptible)
 ```
 
@@ -1031,8 +790,8 @@ Window A (week view):
   dragenter → show drop zone feedback (highlight grid slot)
   dragover  → update snap hint as cursor moves
   drop      → extract task_id from dataTransfer
-  Window A → sidecar: DropTask(task_id, x, y)  ← pixel coords
-  Sidecar: converts pixels → start/duration, mutates, re-renders all windows
+  Window A → sidecar: "schedule task_id at (day, time)"
+  Sidecar: mutates, re-renders all windows, broadcasts
 ```
 
 The sidecar doesn't know or care which window the command came from. It
@@ -1055,7 +814,7 @@ Windows application can receive.
 ### Dragging INTO txxt
 
 | Source | What the browser receives | What txxt does |
-|--------|--------------------------|----------------|
+|--------|-------------------------|----------------|
 | Outlook email | `.msg` file via `dataTransfer.files` | Creates task, attaches email as artifact |
 | Selected text (any app) | `text/plain` via `getData` | Creates task at drop position |
 | File from Explorer | `File` object with name/size/type | Creates task, attaches file as artifact |
@@ -1129,7 +888,7 @@ information out of txxt must be as easy as getting it in.
 When dragging a task FROM txxt to another application:
 
 ```javascript
-// On dragstart for a materialized task div
+// On dragstart for a task
 e.dataTransfer.setData('text/plain',
     'P1 | Fix deleted ingress - prod cl3 | Tue 09:15-10:00');
 e.dataTransfer.setData('text/html',
@@ -1229,7 +988,7 @@ cannot live on User1's CloudPC — it needs to be centrally available.
 ```
 UPLOAD (drop event):
   Browser receives file from DnD (e.g., .msg from Outlook)
-  Browser → sidecar: CreateAt(x, y) + UploadArtifact blob
+  Browser → sidecar: create task + artifact blob
   Sidecar: creates task locally (instant response to user)
   Sidecar → EC2: mutation event + artifact upload (background)
   EC2: persists task mutation + stores artifact blob
@@ -1238,9 +997,9 @@ UPLOAD (drop event):
 RETRIEVE (on demand):
   User2 clicks task → materializes div with task details
   User2 sees attachment indicator (📎), clicks it
-  Browser → sidecar: RequestArtifact(task_id, index)
+  Browser → sidecar: fetch artifact for task_id
   Sidecar → EC2: request artifact
-  EC2 → sidecar → browser: ArtifactData blob
+  EC2 → sidecar → browser: artifact blob
   Browser: opens/downloads the file
 ```
 
@@ -1297,7 +1056,7 @@ render + 50ms encode is invisible at human speed.
 
 ```
 Layer 1: CHROME — grid lines, day labels, hour markers, headers
-  Rendered once per: view change, viewport resize, navigation
+  Rendered once per: view change, viewport resize, week navigation
   Cached as a pixel buffer in memory
   Rarely changes. Expensive but infrequent.
 
@@ -1318,11 +1077,14 @@ Caching it means most renders are just "stamp the tasks onto the grid." At
 
 ### Image format
 
-The wire format includes a `format: u8` byte (message 0x10) so we can switch
-formats without protocol changes:
+Currently: PNG. Proven, browser-native, good compression for solid-color
+rectangles and text. The encode cost is the main concern — PNG encoding a
+1316x632 RGBA buffer takes real CPU time.
 
-- **PNG** (start here): lossless, good compression for solid-color rectangles
-  and text, browser-native. Encode cost is the main concern.
+The wire format includes a `format: u8` byte (message 0x10) specifically so
+we can switch formats without protocol changes:
+
+- **PNG** (current): lossless, good compression, moderate encode cost
 - **JPEG**: lossy but fast encode, smaller wire size. At quality 85+, text is
   readable. Worth benchmarking on actual CloudPC hardware.
 - **Raw RGBA**: zero encode cost, ~3.3MB per frame. The sidecar→browser hop is
@@ -1369,17 +1131,17 @@ No framework.
 ### What IRONCLAD does
 
 - Open WebSocket to local sidecar
-- On connect: send ViewportSize + SetView
-- Receive BackgroundImage → create blob URL → set as CSS `background-image`
-- Track mouse → send CursorMove at 20Hz
-- Receive CandidateList → cache locally (click semantics only)
-- Receive OverlayCommands → execute on SVG/canvas overlay (UX only, no semantics)
+- Receive background image → create blob URL → set as CSS `background-image`
+- Track mouse → send cursor coordinates to sidecar at 20Hz
+- Receive candidate list from sidecar (with SDF distances) → cache locally
+- Draw proximity feedback on canvas overlay (cursor glow, intersection markers)
 - On click → check local candidate cache → materialize one div immediately
-- Drag div → send DropTask on mouseup → dematerialize div → receive new background
-- Handle keybinds → send ModeChange, SetView, NavigateWindow to sidecar
-- Handle external DnD (drag from Outlook/Explorer) → send CreateAt
-- Handle visibility change → send VisibilityChange → resync with sidecar
-- Handle window resize → send ViewportSize
+- Drag div → report position updates to sidecar for snap hints
+- On mouseup → report final position → dematerialize div → receive new background
+- Handle keybinds → send mode signals to sidecar
+- Handle external DnD (drag from Outlook/Explorer/etc.)
+- Handle visibility change → resync with sidecar
+- Handle window resize → report new viewport to sidecar
 
 ### What IRONCLAD does NOT do
 
@@ -1387,7 +1149,6 @@ No framework.
 - Do hit testing (sidecar runs SDF flashlight, browser caches results)
 - Own any world state beyond the candidate cache
 - Run spatial queries
-- Compute times or pixel↔time conversion (sidecar owns all time math)
 - Repaint world during drag (background is frozen, div moves via CSS transform)
 - Import any library, framework, or runtime
 
@@ -1402,6 +1163,19 @@ state**. Proximity feedback, cursor glow, snap guides, and the single
 materialized interaction div are all local UI — they carry no world data,
 they don't duplicate the sidecar's rendering, and they're cheap for the
 VDI codec.
+
+### Current state
+
+IRONCLAD v0.8 is the canvas-era implementation (~1,231 lines). It does
+everything in the "does not" list above. The wire protocol, SoA entity
+storage, and input handling logic are proven and portable. The canvas drawing
+code, the flashlight hit detection, and the DOM proxy pool are all replaced
+by the sidecar image pipeline.
+
+The v0.8 code is a proof of concept. It demonstrated that the binary wire
+protocol works, that drag-and-drop scheduling is the right interaction model,
+and that the spatial bucketing approach is sound. Its rendering approach is
+the opposite of the axiom, and it is being replaced.
 
 ---
 
@@ -1419,21 +1193,16 @@ the candidate manager.
 - Apply mutations → validate → increment revision → persist → broadcast
 
 **Rendering:**
-- Maintain chrome layer cache (grid, labels, headers) per connected window
+- Maintain chrome layer cache (grid, labels, headers)
 - Re-render on state change (chrome + tasks → image → encode → send)
 - One rendering context per connected browser window
 - Software 2D via tiny-skia (no GPU dependency)
 
 **Spatial oracle:**
 - Receive cursor coordinates from browser at 20Hz
-- Compute candidate list (SDF flashlight — see above)
+- Compute candidate list via grid-cell lookup (O(1) + O(k))
 - Push candidate list to browser when it changes
 - On click confirmation: validate materialization
-
-**Pixel↔time translation:**
-- All task operations from the browser arrive as pixel coordinates
-- Sidecar converts: drop position (x, y) → start (minutes since epoch) + duration
-- EC2-bound mutations carry canonical time values, never pixels
 
 **Artifact relay:**
 - Receive artifact uploads from browser
@@ -1441,23 +1210,16 @@ the candidate manager.
 - Fetch artifacts from EC2 on demand
 
 **EC2 communication:**
-- Send local mutations to EC2 (time-based, post-translation)
+- Send local mutations to EC2
 - Receive mutations from other users via EC2 broadcast
 - Re-render affected windows when remote mutations arrive
 - Resync on reconnect (revision-based delta or full snapshot)
 
 ### What the sidecar is NOT
 
-It is not a web server in the meaningful sense. In practice, it serves the
-three frontend static files (index.html, ironclad.js, styles.css) on the
-same localhost port as the WebSocket — this is a pragmatic choice, not an
-architectural one. Same-origin serving avoids CORS complications and means
-there is exactly one thing to run and one URL to open. The files are small,
-static, and almost never change. This is IPC plumbing, not a service.
-
-What it explicitly does NOT do over HTTP: REST API, server-side rendering,
-JSON responses, business logic of any kind. The only HTTP it handles is the
-initial page load. Everything after that is WebSocket.
+It is not a web server. It serves no HTML, no CSS, no JavaScript. The static
+frontend files are served by whatever mechanism deploys the CloudPC image
+(local file, CDN, EC2 static hosting — doesn't matter, they change rarely).
 
 It is not a database server. redb is a local save file, loaded once on boot,
 flushed on mutation. Never queried at runtime.
@@ -1465,40 +1227,6 @@ flushed on mutation. Never queried at runtime.
 It is not a game server in the traditional sense. There is no tick loop, no
 physics, no simulation. Events arrive, state changes, images render. Between
 events: silence.
-
----
-
-## Deployment
-
-For a 5-20 person ops team, deployment is deliberately informal. No IT
-procurement. No installer package. No update server. No signing ceremony.
-
-**On each CloudPC:**
-
-```
-git clone <public repo>   # link shared over Teams
-cargo build --release
-./target/release/txxt     # or cargo run during development
-```
-
-Open Chromium. Navigate to `http://localhost:3000`. Done.
-
-The sidecar serves the frontend files from `frontend/` on the same port as
-the WebSocket. This is why: a `file://` URL for index.html would require
-browser flags to allow WebSocket connections to localhost, which is fragile
-and varies across Chromium versions. Serving both from the same localhost
-origin sidesteps this entirely. One process, one URL, no browser flag
-gymnastics.
-
-**Updates:** `git pull && cargo build --release`. Same informal process. The
-ops team is technical. This works until it doesn't, at which point the
-deployment model grows up — but we are not there yet.
-
-**Why this works for citizen development:** the sidecar binary is the only
-dependency. redb is embedded. The frontend is static files in the repo. No
-database server to run. No reverse proxy to configure. No package manager
-with six conflicting lockfile formats. An ops engineer who can run a terminal
-can deploy this.
 
 ---
 
@@ -1512,22 +1240,20 @@ render. It does not compute layouts or hit test.
 - Accept WebSocket connections from all sidecars
 - Receive state mutations: `[user_id][event_type][payload]`
 - Broadcast mutations to all other connected sidecars
-- Persist canonical world state (database TBD — redb for v1 is reasonable;
-  the EC2 is a T3 large capable of more, definitive choice deferred)
+- Persist canonical world state to redb
 - Store and serve shared artifacts (email attachments, files, etc.)
 - On sidecar reconnect: send full snapshot or event deltas since last_seen_rev
-
-The EC2 does NOT render for sidecars. Each user's view is unique (different
-viewport, different view mode, different visible date range). Only the local
-sidecar knows what image to produce.
+- The EC2 does NOT render for sidecars. Each user's view is unique (different
+  viewport, different view mode, different visible date range). Only the local
+  sidecar knows what image to produce.
 
 ---
 
 ## Drop Zones — Every Region Is a Semantic Target
 
 When the user drops something on the browser window, the drop position carries
-meaning. The sidecar interprets the pixel coordinates based on which region
-they fall in:
+meaning. The sidecar interprets the coordinates based on which region they
+fall in:
 
 | Drop target | What happens |
 |-------------|--------------|
@@ -1558,7 +1284,7 @@ IDLE
 
 HOVER (cursor near candidates)
   Spatial queries: running, candidate list fresh
-  Canvas overlay: cursor glow, proximity feedback active
+  Canvas overlay: cursor glow, optional candidate highlight
   Background: static
   Pit crew: ready
 
@@ -1612,12 +1338,10 @@ struct Task {
 }
 ```
 
-**Timeline model (locked 2026-02-19).** `start` encodes both date and time.
-Derive everything: `epoch_day = start / 1440`, `day_of_week = (epoch_day + 3) % 7`
-(0=Mon..6=Sun), `time_of_day = start % 1440`. Views are sliding windows
-(`window_start..window_end`, both in minutes since epoch) — same query shape
-for day, week, and month. The sidecar owns all time math and pixel↔time
-conversion. The browser never computes times.
+All time values derived from `start`: `epoch_day = start / 1440`, `day_of_week = (epoch_day + 3) % 7`
+(0=Mon..6=Sun), `time_of_day = start % 1440`. Views are sliding windows: `window_start..window_end`
+in minutes since epoch — same query for day, week, and month. The sidecar owns all time math.
+Browser never computes week boundaries or pixel↔time conversion.
 
 ### Service — who pays for the time
 
@@ -1625,8 +1349,7 @@ conversion. The browser never computes times.
 struct Service { id: Uuid, name: String }
 ```
 
-Services are the primary organizational axis. 12 default services. Metadata
-TBD when real data sources arrive.
+12 default services. Metadata TBD when real data sources arrive.
 
 ### User — a player
 
@@ -1636,103 +1359,12 @@ struct User { id: Uuid, username: String, password_hash: String }
 
 ---
 
-## Wire Protocol — Two Hops, Two Vocabularies
+## Wire Protocol — WebSocket Binary
 
-There are **two separate wire hops** with fundamentally different semantics.
-Do not conflate them.
+All game data over WebSocket uses fixed-stride packed binary, readable by
+DataView at known offsets. JSON is never used in the data path.
 
-```
-Browser  ──── pixel coords ────▶  Sidecar  ──── canonical times ────▶  EC2
-         ◀─── images + hints ────          ◀─── snapshots + deltas ────
-```
-
-The browser knows pixels. The sidecar knows times. The sidecar is the
-translation layer. All task operations from the browser arrive in pixel
-coordinates. By the time anything reaches EC2, coordinates have been converted
-to canonical `start` (minutes since epoch) and `duration` (minutes).
-
-JSON is never used in either hop. First byte of every message is the type.
-
----
-
-### Hop 1: Browser ↔ Sidecar (localhost WebSocket — the hot path)
-
-The browser never receives raw task records. It receives rendered images and
-candidate lists. In the new architecture, the browser does not maintain a world
-model — it maintains only a candidate cache.
-
-#### Sidecar → Browser
-
-**Image pipeline:**
-- `0x10` BackgroundImage: `[type][rev:u64][format:u8][width:u16][height:u16][bytes...]`
-  - format: 0=PNG, 1=JPEG, 2=raw RGBA
-- `0x11` CandidateList: `[type][count:u8]` then per candidate:
-  `[task_id:16][x:u16][y:u16][w:u16][h:u16][color:u32][sdf_dist:i16][title_len:u8][title...]`
-  - Semantic only: "if the user clicks, here is what to materialize."
-  - `sdf_dist` is signed: negative = cursor is inside the element.
-  - The browser does NOT derive overlay geometry from this. That is OverlayCommands.
-
-**Overlay (UX feedback — independent from candidate semantics):**
-- `0x1A` OverlayCommands: `[type][count:u8]` then per command:
-  `[cmd:u8][x1:u16][y1:u16][x2:u16][y2:u16][color:u32]`
-  - cmd=0 Clear: wipe the overlay (remaining fields ignored)
-  - cmd=1 Arc: arc from (x1,y1) to (x2,y2). Used for two things depending on
-    chosen viz approach: clipped arc of an element boundary (cel shader), or
-    arc of the flashlight circle itself at an intersection point (approach 2).
-    The browser doesn't need to know which — it just draws the arc.
-  - cmd=2 Segment: clipped straight edge of an element boundary from (x1,y1) to (x2,y2)
-  - The sidecar clips each element's boundary edges to the flashlight circle interior
-    before sending. What the browser receives are element edge fragments, not flashlight
-    geometry. Pure visual feedback, no click semantics. Empty space = no commands =
-    overlay silent = codec sleeps.
-
-**Interaction feedback:**
-- `0x18` SnapHint: `[type][x:u16][y:u16]` — snapped grid position during drag
-- `0x19` CursorStyle: `[type][style:u8]` — 0=default, 1=pointer, 2=resize-ns, ...
-
-#### Browser → Sidecar
-
-**Connection context** (sent on connect, resent on change):
-- `0x20` ViewportSize: `[type][width:u16][height:u16]`
-- `0x21` SetView: `[type][mode:u8]` — WEEK=0, MONTH=1, DAY=2
-- `0x22` VisibilityChange: `[type][visible:u8][last_seen_rev:u64]`
-
-**Cursor and interaction:**
-- `0x23` CursorMove: `[type][x:u16][y:u16]` — sent at 20Hz
-- `0x24` ModeChange: `[type][mode:u8]` — IDLE=0, DRAG=1, TYPING=2
-- `0x25` ClickAt: `[type][x:u16][y:u16]`
-
-**Navigation:**
-- `0x26` NavigateWindow: `[type][delta:i8]` — ±1 step in current view mode
-  (day view: 1 day, week view: 1 week, month view: 1 month)
-
-**Task operations — pixel-based** (sidecar converts to times):
-- `0x27` CreateAt: `[type][x:u16][y:u16]` — double-click create; sidecar derives
-  start/duration from pixel position, creates task, re-renders, opens for editing
-- `0x28` DropTask: `[type][task_id:16][x:u16][y:u16]` — drop existing task;
-  sidecar converts pixel position → new start/duration
-- `0x29` ResizeTask: `[type][task_id:16][bottom_y:u16]` — drag bottom edge;
-  sidecar converts pixel → new duration
-- `0x2A` UnscheduleTask: `[type][task_id:16]`
-- `0x2B` CompleteTask: `[type][task_id:16]`
-- `0x2C` DeleteTask: `[type][task_id:16]`
-- `0x2D` UpdateTitle: `[type][task_id:16][title:UTF-8...]`
-- `0x2E` SetPriority: `[type][task_id:16][priority:u8]`
-
-**Artifacts:**
-- `0x30` UploadArtifact: `[type][task_id:16][filename_len:u8][filename...][blob...]`
-- `0x31` RequestArtifact: `[type][task_id:16][artifact_index:u8]`
-- `0x32` ArtifactData: `[type][task_id:16][filename_len:u8][filename...][blob...]`
-  (sidecar → browser response)
-
----
-
-### Hop 2: Sidecar ↔ EC2 (WAN WebSocket — persistence and broadcast)
-
-The sidecar has already translated pixel coordinates to world time values before
-anything reaches EC2. EC2 speaks entirely in canonical task state.
-
-#### Task record (192 bytes, fixed stride)
+### Task record (192 bytes, fixed stride)
 
 ```
 [0..16]    id (UUID, 16 bytes)
@@ -1743,37 +1375,67 @@ anything reaches EC2. EC2 speaks entirely in canonical task state.
 [24..40]   service_id (UUID, 16 bytes)
 [40..56]   assigned_to (UUID, 16 bytes, zeroed = unassigned)
 [56..184]  title (128 bytes, UTF-8, zero-padded)
-[184..192] _reserved (artifact_count + future fields)
+[184..192] _reserved (available for artifact_count and future fields)
 ```
 
-#### Service record (80 bytes, fixed stride)
+### Service record (80 bytes, fixed stride)
 
 ```
 [0..16]    id (UUID, 16 bytes)
 [16..80]   name (64 bytes, UTF-8, zero-padded)
 ```
 
-#### EC2 → Sidecar
+### Server → Client messages
 
-- `0x01` WorldSnapshot: `[type][rev:u64][task_count:u32][svc_count:u32][tasks...][svcs...]`
+First byte is message type:
+
+**State messages:**
+- `0x01` Snapshot: `[type][rev:u64][task_count:u32][svc_count:u32][tasks...][svcs...]`
 - `0x02` TaskCreated: `[type][rev:u64][task_record:192]`
-- `0x03` TaskMoved: `[type][rev:u64][task_id:16][start:u32][dur:u16]`
-- `0x04` TaskUnscheduled: `[type][rev:u64][task_id:16]`
-- `0x05` TaskCompleted: `[type][rev:u64][task_id:16]`
-- `0x06` TaskDeleted: `[type][rev:u64][task_id:16]`
-- `0x07` TitleUpdated: `[type][rev:u64][task_id:16][title:UTF-8...]`
+- `0x03` TaskScheduled: `[type][rev:u64][task_id:16][start:u32][dur:u16]`
+- `0x04` TaskMoved: same layout as TaskScheduled
+- `0x05` TaskUnscheduled: `[type][rev:u64][task_id:16]`
+- `0x06` TaskCompleted: `[type][rev:u64][task_id:16]`
+- `0x07` TaskDeleted: `[type][rev:u64][task_id:16]`
 
-#### Sidecar → EC2
+**Image pipeline messages (designed, not yet implemented):**
+- `0x10` BackgroundImage: `[type][rev:u64][format:u8][width:u16][height:u16][image_bytes...]`
+  - format: 0=PNG, 1=JPEG, 2=raw RGBA (extensible)
+- `0x11` CandidateList: `[type][count:u8][[task_id:16][x:u16][y:u16][w:u16][h:u16][color:u32][sdf_dist:i16][title_len:u8][title_bytes...]...]`
+  - `sdf_dist`: signed distance in pixels (i16, negative = cursor inside element). Browser uses this for tiered proximity feedback — intersection markers, glow intensity, etc.
 
-- `0x10` MutationEvent: `[type][user_id:16][event_type:u8][payload...]`
-  (same event types as EC2→Sidecar; EC2 broadcasts to all other sidecars)
-- `0x11` SidecarSync: `[type][last_seen_rev:u64]` (sent on connect/reconnect)
+**Sidecar → browser feedback:**
+- `0x18` SnapHint: `[type][x:u16][y:u16]` (snapped grid position during drag)
+- `0x19` CursorStyle: `[type][style:u8]` (0=default, 1=pointer, 2=resize-ns, etc.)
 
-#### Sync semantics
+### Client → Server commands
 
-Every EC2→Sidecar event carries `rev:u64`. Sidecar tracks `last_seen_rev`. On
-reconnect, sidecar sends SidecarSync; EC2 replies with WorldSnapshot or targeted
-deltas since that revision. One resync protocol handles all disconnection cases.
+**Task commands:**
+- `0x10` CreateTask: `[type][priority:u8][service_id:16][assigned_to:16][start:u32][dur:u16][title:UTF-8...]`
+- `0x11` ScheduleTask: `[type][task_id:16][start:u32][dur:u16]`
+- `0x12` MoveTask: same layout as ScheduleTask
+- `0x13` UnscheduleTask: `[type][task_id:16]`
+- `0x14` CompleteTask: `[type][task_id:16]`
+- `0x15` DeleteTask: `[type][task_id:16]`
+
+**Input pipeline messages (designed, not yet implemented):**
+- `0x20` CursorMove: `[type][x:u16][y:u16]` (sent at 20Hz)
+- `0x21` ModeChange: `[type][mode:u8]` (IDLE=0, DRAG=1, TYPING=2, MONTH=3, COLLAPSED=4)
+- `0x22` ClickAt: `[type][x:u16][y:u16]`
+- `0x23` ViewportSize: `[type][width:u16][height:u16]` (sent on connect + resize)
+- `0x24` VisibilityChange: `[type][visible:u8][last_seen_rev:u64]` (alt-tab resync)
+
+**Artifact messages (designed, not yet implemented):**
+- `0x30` UploadArtifact: `[type][task_id:16][filename_len:u8][filename...][blob...]`
+- `0x31` RequestArtifact: `[type][task_id:16][artifact_index:u8]`
+- `0x32` ArtifactData: `[type][task_id:16][filename_len:u8][filename...][blob...]` (response)
+
+### Sync semantics
+
+Every state event carries a revision number (u64 LE at offset 1). Browser
+tracks last_seen_rev. On reconnect or alt-tab return: browser sends
+last_seen_rev, sidecar sends deltas since then (or full snapshot if gap too
+large).
 
 ---
 
@@ -1782,27 +1444,30 @@ deltas since that revision. One resync protocol handles all disconnection cases.
 All scheduling happens through direct manipulation. No forms. No modals.
 The world IS the interface.
 
-| Gesture | Action |
-|---------|--------|
-| Click task | Materialize div, select |
-| Drag task | Move to slot (DropTask) |
-| Double-click grid | Create 30m task (CreateAt) |
-| Drag bottom edge | Resize duration (ResizeTask) |
-| Alt+drag | Clone task |
-| Drop from external app | Create task + attach artifact |
-| Drag task to external app | Export task summary |
-| Alt-C | Collapse calendar |
-| Alt-M | Monthly view (read-only) |
-| Inline title editing | Edit task title after creation |
-| Modifier-click | Manual time entry (deferred) |
+| Gesture | Action | Status |
+|---------|--------|--------|
+| Click task | Materialize, select | Canvas-era impl, to port |
+| Drag task | Move to slot | Canvas-era impl, to port |
+| Double-click grid | Create 30m task | Canvas-era impl, to port |
+| Drag bottom edge | Resize duration | Canvas-era impl, to port |
+| Alt+drag | Clone task | Canvas-era impl, to port |
+| Drop from external app | Create task + attach artifact | DESIGNED |
+| Drag task to external app | Export task summary | DESIGNED |
+| Alt-C | Collapse calendar | DONE |
+| Alt-M | Monthly view | DONE (read-only) |
+| Inline title editing | Edit task title after creation | DEFERRED |
+| Modifier-click | Manual time entry | DEFERRED |
 
-### Snap resolution
+"Canvas-era impl" = proven in current IRONCLAD v0.8, needs porting to the
+sidecar image pipeline model. The interaction logic is validated; the
+rendering approach changes.
+
+### Snap resolution (planned)
 
 - **Move:** snap to 30 minutes (coarse — "put it at 2pm")
 - **Resize:** snap to 5 minutes (fine — "this takes 25 minutes")
 
-Ergonomically sound. Move needs to feel fast and chunky. Resize needs
-precision. Server validation should use `% 5` (5-minute grid), not `% 15`.
+Server validation needs relaxing from `% 15` to `% 5` to support this.
 
 ---
 
@@ -1812,30 +1477,13 @@ precision. Server validation should use `% 5` (5-minute grid), not `% 15`.
 JSON only at the auth boundary (login). Everything else is binary packed
 structs. Fast to encode, fast to decode, no parsing overhead, no ambiguity.
 
-### redb on the sidecar (confirmed)
-Pure Rust, single-file, ACID. Treated as a save file on the CloudPC: load once
-on boot, flush on mutation, never query at runtime. Chosen for speed and
-near-zero footprint on the resource-constrained CloudPC.
+### redb stays
+Pure Rust, single-file, ACID. Treated as a save file. Load once, flush on
+mutation, never query at runtime. Both sidecar and EC2 use it.
 
-### EC2 database (TBD)
-The EC2 is the source of truth. It also stores artifacts and future logs.
-The EC2 is a T3 large — a capable server not subject to the same constraints
-as the CloudPC. Likely redb for v1 (consistency, simplicity), but the final
-choice is deferred. The protocol doesn't care what the EC2 stores internally.
-
-### Minimize elements that hurt performance
-**Zero elements that render world state** — tasks, grid lines, text labels,
-time markers. These are rendered by the sidecar and sent as an image. Any
-browser element that duplicates this creates constant dirty pixels, causes
-codec churn, and produces two divergent rendering paths. This part is a hard
-rule with a clear reason.
-
-Beyond that: the right number of interaction elements (materialized divs, snap
-guides, drop zone highlights, proximity markers) is whatever the CloudPC can
-actually handle. We don't know that number until we test on real hardware under
-real VDI conditions — two hops of lag compound in ways that are invisible on a
-dev machine. Hydrating all nearby candidates as divs might be snappy. It might
-collapse. Measure first, decree later.
+### One div at a time
+The browser never has more than one interactive DOM element at any moment.
+Zero divs at rest. This is an architectural constraint, not a guideline.
 
 ### Sidecar renders, browser displays
 The browser does not compute pixel positions from task data. The sidecar
@@ -1846,10 +1494,6 @@ Client-side rendering divergence is impossible.
 The browser forwards click coordinates. The sidecar holds the candidate list
 and the browser caches it. No client-side spatial queries beyond the trivial
 point-in-rect check against cached candidates.
-
-### Browser never does time math
-All pixel↔time conversion happens in the sidecar. The browser sends pixel
-coordinates. The sidecar derives start/duration. EC2 never sees pixels.
 
 ### 20Hz cursor forwarding
 Human reaction time is 100-200ms. 20Hz (50ms intervals) is sufficient for
@@ -1893,82 +1537,60 @@ workgroup on a VPN. Hardening is a future phase. Correctness and speed first.
 
 ---
 
-## Build Order
-
-All source is being written from scratch. Previous source code was pre-axiom
-and is archived. Clean slate. The only thing carried forward is knowledge:
-tiny-skia works for CPU rendering, the binary wire protocol approach is sound,
-drag-and-drop is the right interaction model.
-
-1. **`world.rs`** — pure state machine, no I/O. Task/Service/User, Command/Event
-   enums, `apply()`, revision counter. Fully unit-testable in isolation.
-
-2. **`wire.rs`** — encode/decode for both hops. Browser↔sidecar pixel protocol
-   (0x20-0x32). Sidecar↔EC2 task protocol (0x01-0x11). Fixed-stride binary,
-   DataView-compatible offsets.
-
-3. **`renderer.rs`** — tiny-skia renderer. `render_world(world, view_state) → PNG`.
-   ViewState = `{mode, window_start: u32, window_end: u32}`. Two-layer chrome
-   cache. Text deferred to Phase 2 (resvg/SVG pipeline).
-
-4. **`game.rs`** — WebSocket handler. Per-connection context (viewport, view mode,
-   candidate list, chrome cache). Wires world + renderer + wire together.
-   subscribe-before-snapshot pattern.
-
-5. **IRONCLAD** — ~200 lines, glass model. BackgroundImage display, CandidateList
-   caching, canvas overlay for proximity glow, single div materialization.
-
-6. **Spatial query** — SDF flashlight in sidecar. CandidateList push on change.
-   Start with Approach A (pure SDF). Build optimization path only if profiling
-   demands it.
-
-7. **EC2 + sidecar↔EC2 protocol** — relay server, snapshot/delta sync,
-   artifact storage.
-
----
-
-## Deferred Sessions
-
-**Text rendering:** resvg (SVG pipeline) chosen over raw tiny-skia for Phase 2.
-Unlocks text, shadows, gradients, rounded corners. SVG string built procedurally
-per render. fontdb + rustybuzz for font loading and shaping. Bitmap font for
-grid chrome (hour labels, day headers), resvg for task titles and log entries.
-Defer until div materialization + SDF canvas overlay are working.
-
-**Task log (collaborative journal):** Per-task append-only log. Separate from
-world audit trail (which is unbounded and must stay that way — full fidelity
-time-travel is the goal, do NOT cap it). Log entries: `{ id, task_id, user_id,
-timestamp: u32 (seconds), text: String }`. Load-on-demand wire messages.
-Renders as sidecar image panel; only the text input field is live DOM. Word
-wrap needed (fontdb glyph metrics + tspan). Future: @mentions, per-entry
-reactions. Defer until rendering pipeline is solid.
-
-**Snap resolution:** Server validation should use 5-minute grid (`% 5`), not
-15-minute. Move snaps to 30 min (coarse), resize snaps to 5 min (fine).
-
-**Recurring tasks / multi-day spans:** Real features for the ops use case.
-Multi-day = three cloned tasks (Mon/Tue/Wed), not a spanning entity. Recurring
-= a separate subsystem (rule engine, exception handling, template vs instance).
-Both deserve their own design sessions when the basic scheduling loop is proven.
-
-**Chrome / palette:** All visual properties (fill, border, animation) should
-become configurable tokens. Current colours are placeholder. Dedicated design
-session needed.
-
----
-
 ## What's Archived
 
 `archive/` contains:
-- Canvas/WASM era frontend experiments
-- Pre-axiom design docs and brainstorming
-- Pre-axiom source code (world.rs, wire.rs, game.rs, renderer.rs, ironclad.js)
-  — these proved the concepts but used the wrong architecture. Knowledge kept,
-  code discarded.
+- The Clay/WASM era: dead frontend experiment
+- Old handover docs and screenshots
 - `BRAINSTORM-2026-02-10.md`: pre-axiom brainstorming (many decisions now
-  reversed — notably "no server-side rendering" became "sidecar renders everything")
+  reversed — e.g., "No server-side rendering" is now the entire architecture)
 - `analysis-sonnet-arch-review-2026-02-11.md`: stale Sonnet review from before
-  the axiom rewrite
+  the epoch-days migration and the axiom rewrite
+
+The current `frontend/ironclad.js` (canvas rendering era, v0.8) is living code
+but represents the pre-axiom implementation. The wire protocol, SoA structure,
+and interaction logic are proven and portable. The canvas rendering code is not
+the final form. See the "Current state" note in the IRONCLAD section above.
+
+---
+
+## What's Built and Working
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| `world.rs` | Solid | Pure state machine, 21 tests, full lifecycle |
+| `wire.rs` | Solid | Binary protocol, 12 tests, round-trip validated |
+| `persist.rs` | Solid | redb ACID, 4 tests, survives format migrations |
+| `game.rs` | Solid | WebSocket handler, subscribe-before-snapshot |
+| `auth.rs` | Dev mode | JWT + Argon2, hardcoded secret, WS bypass |
+| `renderer.rs` | Proof of concept | tiny-skia renders world to PNG, /api/render endpoint |
+| `ironclad.js` | Canvas era (v0.8) | Full interaction model, wrong rendering architecture |
+
+### What's designed but not yet implemented
+
+| Feature | Designed in | Blocks on |
+|---------|-------------|-----------|
+| BackgroundImage (0x10) pipeline | This document | renderer.rs → game.rs wiring |
+| CandidateList (0x11) push | This document | Spatial query in sidecar |
+| CursorMove (0x20) handling | This document | New IRONCLAD |
+| Viewport negotiation (0x23) | This document | New IRONCLAD + renderer resize |
+| Visibility resync (0x24) | This document | New IRONCLAD |
+| Cross-app DnD (in/out) | This document | New IRONCLAD |
+| Artifact upload/retrieve | This document | EC2 development |
+| Multi-window rendering | This document | Per-connection render contexts |
+| New IRONCLAD (~200 lines) | This document | All of the above |
+
+### What's next
+
+The backend organs (world.rs, wire.rs, persist.rs) are keepers. The renderer
+proof of concept (renderer.rs) confirms tiny-skia works. The next phase is:
+
+1. Add new wire message types (0x10-0x24, 0x30-0x32) to wire.rs
+2. Wire renderer into game.rs (state change → render → broadcast image)
+3. Write new IRONCLAD from scratch (glass, not canvas)
+4. Add spatial query and candidate list management to sidecar
+5. Port interaction gestures from v0.8 to the new model
+6. Build EC2 relay and artifact storage
 
 ---
 

@@ -1,1231 +1,784 @@
-/**
- * IRONCLAD ENGINE v0.8 — Server-Connected Build
- *
- * Canvas/DOM hybrid renderer for time tracking on software-rendered CloudPCs.
- * No dependencies. No build step.
- *
- * v0.8: Monthly view (Alt-M). Epoch-date model (Task.date u16). All keyboard
- *        shortcuts consolidated into the engine — global, view-independent.
- *        SoA now stores dates[] for monthly day-cell lookup.
- *
- * v0.7: Alt+drag to clone tasks. SoA now stores raw priority and service UUID
- *        per entity so clones carry full metadata. _sendCreateTask accepts
- *        optional title/priority/serviceId params (defaults for dblclick).
- *
- * v0.6: WebSocket connection to txxt game server. Binary wire protocol.
- *        Fixed-stride packed records read via DataView. No JSON.
- *
- * Previous fixes (v0.5):
- *  - Frame-stamp dedup for multi-bucket entities
- *  - Pre-allocated candidate arrays (zero hot-path allocation)
- *  - Flat array spatial index (no Map in hot loop)
- *  - Arrow rAF callback (no .bind() per frame)
- *  - Per-frame drag latency (not cumulative)
- *  - textContent stats (no innerHTML churn)
- *  - Grid snap derived from HOUR_HEIGHT, not magic numbers
- */
+// ============================================================================
+// IRONCLAD — Flashlight Overlay Stress Test
+//
+// Two sections:
+//   1. Overlay class      (PRODUCTION — survives into final IRONCLAD)
+//   2. TestHarness class  (THROWAWAY — replaced by Rust sidecar)
+//
+// Open frontend/index.html in a browser. No server needed.
+// ============================================================================
 
-// ─── Config ─────────────────────────────────────────────────────────────────
+'use strict';
 
-const CONFIG = {
-    // Layout (px)
-    LEFT_GUTTER: 56,
-    TOP_HEADER: 32,
-    DAY_WIDTH: 180,
-    HOUR_HEIGHT: 60,
+// ============================================================================
+// §1  OVERLAY MODULE — PRODUCTION CODE
+//
+// A dumb SVG executor. Receives draw commands. Draws them. Knows nothing
+// about shapes, SDF, cursor position, or the world.
+//
+// Command format (mirrors sidecar 0x1A OverlayCommands):
+//   { type: 'segment', x1, y1, x2, y2 }
+//   { type: 'arc', cx, cy, r, startAngle, sweepAngle }
+//   { type: 'clear' }
+// ============================================================================
 
-    // Time
-    DAYS: 7,
-    START_HOUR: 8,
-    END_HOUR: 18,
+class Overlay {
+    /**
+     * @param {HTMLElement} container — positioned element to overlay
+     * @param {Object} opts
+     * @param {number} [opts.segmentPoolSize=48]
+     * @param {number} [opts.arcPoolSize=16]
+     * @param {string} [opts.color='#00ff66']
+     * @param {number} [opts.strokeWidth=2]
+     */
+    constructor(container, opts = {}) {
+        const o = Object.assign({
+            segmentPoolSize: 48,
+            arcPoolSize: 16,
+            color: '#00ff66',
+            strokeWidth: 2,
+        }, opts);
 
-    // Engine
-    FLASHLIGHT_RADIUS: 150,
-    POOL_SIZE: 15,
-    BUCKET_WIDTH: 200,
-    MAX_ENTITIES: 10000,
-    MAX_BUCKETS: 100,
-};
+        this.segmentPoolSize = o.segmentPoolSize;
+        this.arcPoolSize = o.arcPoolSize;
+        this.color = o.color;
+        this.strokeWidth = o.strokeWidth;
 
-const DAY_LABELS = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
-const HOURS = CONFIG.END_HOUR - CONFIG.START_HOUR;
-const SNAP_Y = CONFIG.HOUR_HEIGHT / 4; // 15-minute grid
+        // Create SVG root
+        const ns = 'http://www.w3.org/2000/svg';
+        this.svg = document.createElementNS(ns, 'svg');
+        this.svg.setAttribute('class', 'overlay-svg');
+        container.appendChild(this.svg);
 
-// Task label fragments — verbose on purpose, text is dead weight we measure
-const LABEL_VERBS = ['Review', 'Update', 'Fix', 'Deploy', 'Test', 'Write', 'Plan', 'Design', 'Debug', 'Refactor'];
-const LABEL_NOUNS = ['API docs', 'homepage', 'auth flow', 'dashboard', 'CI pipeline', 'database', 'UI tests', 'sprint plan', 'onboarding', 'backlog'];
-const LABEL_REASONS = [
-    'Needs sign-off from stakeholders before EOD Friday',
-    'Blocked until the upstream API migration completes',
-    'Critical path item for the Q3 release milestone',
-    'Compliance requirement from the latest security audit',
-    'Technical debt accumulated over the last three sprints',
-    'Dependency on the shared component library upgrade',
-    'Performance regression flagged in last week\'s report',
-    'Requested by product owner during sprint planning',
-];
-const LABEL_BULLETS = [
-    'Verify all edge cases against the test matrix',
-    'Update the integration tests for new endpoints',
-    'Cross-reference with the ServiceNow ticket backlog',
-    'Coordinate with DevOps on the deployment window',
-    'Document any breaking changes in the changelog',
-    'Run load tests against staging before merge',
-    'Get peer review from at least two team members',
-    'Sync with the design system token updates',
-    'Check backwards compatibility with legacy clients',
-    'Validate against the accessibility requirements',
-];
-
-// Entity type colors: [fill, stroke]
-const TYPE_COLORS = [
-    ['#1e3a5f', '#3a7bd5'], // Task — blue (Low/Medium priority)
-    ['#1a4a3a', '#2d9b7a'], // Event — teal (High priority)
-    ['#4a3a1a', '#b4882d'], // Milestone — amber (Urgent priority)
-];
-
-// ─── Wire protocol (mirrors backend/src/wire.rs) ────────────────────────────
-
-const WIRE = {
-    // Server → Client message types
-    SNAPSHOT:         0x01,
-    TASK_CREATED:     0x02,
-    TASK_SCHEDULED:   0x03,
-    TASK_MOVED:       0x04,
-    TASK_UNSCHEDULED: 0x05,
-    TASK_COMPLETED:   0x06,
-    TASK_DELETED:     0x07,
-
-    // Client → Server command types
-    CMD_CREATE_TASK:  0x10,
-    CMD_MOVE_TASK:    0x12,
-
-    // Record strides (bytes)
-    TASK_STRIDE:      192,
-    SERVICE_STRIDE:   80,
-    SNAPSHOT_HEADER:  17,
-
-    // Task record field offsets
-    TASK_ID:          0,   // 16 bytes UUID
-    TASK_STATUS:      16,  // u8
-    TASK_PRIORITY:    17,  // u8
-    TASK_DATE:        18,  // u16 LE epoch days since 1970-01-01 (0xFFFF = staged)
-    TASK_START_TIME:  20,  // u16 LE
-    TASK_DURATION:    22,  // u16 LE
-    TASK_SERVICE_ID:  24,  // 16 bytes UUID
-    TASK_ASSIGNED_TO: 40,  // 16 bytes UUID
-    TASK_TITLE:       56,  // 128 bytes UTF-8 zero-padded
-
-    // Service record field offsets
-    SVC_ID:           0,   // 16 bytes UUID
-    SVC_NAME:         16,  // 64 bytes UTF-8 zero-padded
-};
-
-// ─── Engine ─────────────────────────────────────────────────────────────────
-
-class IroncladEngine {
-    constructor(containerId) {
-        const el = document.getElementById(containerId);
-        if (!el) throw new Error(`#${containerId} not found`);
-        this.container = el;
-        this.container.style.position = 'relative';
-        this.container.style.overflow = 'hidden';
-
-        // ── SoA entity storage ──
-        this.count = 0;
-        this.ids        = new Int32Array(CONFIG.MAX_ENTITIES);
-        this.xs         = new Float32Array(CONFIG.MAX_ENTITIES);
-        this.ys         = new Float32Array(CONFIG.MAX_ENTITIES);
-        this.ws         = new Float32Array(CONFIG.MAX_ENTITIES);
-        this.hs         = new Float32Array(CONFIG.MAX_ENTITIES);
-        this.types      = new Uint8Array(CONFIG.MAX_ENTITIES);
-        this.priorities = new Uint8Array(CONFIG.MAX_ENTITIES);          // raw priority 0-3
-        this.dates      = new Uint16Array(CONFIG.MAX_ENTITIES);         // epoch days (0xFFFF = staged)
-        this.labels     = new Array(CONFIG.MAX_ENTITIES);               // strings can't live in typed arrays
-        this.uuids      = new Uint8Array(CONFIG.MAX_ENTITIES * 16);     // 16-byte UUIDs, flat
-        this.serviceIds = new Uint8Array(CONFIG.MAX_ENTITIES * 16);     // 16-byte service UUIDs, flat
-
-        // ── View state ──
-        this.viewMode = 'week'; // 'week' | 'month'
-
-        // ── Server connection state ──
-        this.ws_conn = null;
-        this.revision = 0;
-        this.connected = false;
-        this.defaultServiceId = null; // Uint8Array(16), set from first service in snapshot
-
-        // ── Spatial index: array-of-arrays, reused via length reset ──
-        this.buckets = new Array(CONFIG.MAX_BUCKETS);
-        for (let i = 0; i < CONFIG.MAX_BUCKETS; i++) this.buckets[i] = [];
-
-        // ── Frame-stamp dedup (entities spanning multiple buckets) ──
-        this.frameStamp = new Uint32Array(CONFIG.MAX_ENTITIES);
-        this.currentFrame = 0;
-
-        // ── Pre-allocated candidate buffers (zero alloc in hot path) ──
-        this.candidateIdx  = new Int32Array(CONFIG.MAX_ENTITIES);
-        this.candidateDist = new Float64Array(CONFIG.MAX_ENTITIES);
-        this.candidateCount = 0;
-
-        // ── DOM pool ──
-        this.pool = [];
-
-        // ── Canvas ──
-        this.dpr = window.devicePixelRatio || 1;
-        this.canvas = document.createElement('canvas');
-        this.canvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;';
-        this.container.appendChild(this.canvas);
-        this.ctx = this.canvas.getContext('2d', { alpha: false });
-        if (!this.ctx) throw new Error('Canvas 2D unavailable');
-
-        // ── Input state ──
-        this.mouseX = -9999;
-        this.mouseY = -9999;
-        this.prevMX = -9999;
-        this.prevMY = -9999;
-        this.dirty = true;
-
-        // ── Drag state ──
-        this.dragIdx = -1;
-        this.dragMode = 'move'; // 'move', 'resize-top', 'resize-bottom', 'clone'
-        this.dragOffX = 0;
-        this.dragOffY = 0;
-        this.dragInputTime = 0;
-        this.cloneOriginX = 0; // original position saved on clone drag start
-        this.cloneOriginY = 0;
-
-        // ── Perf ring buffer ──
-        this.frameTimes = new Float64Array(60);
-        this.ftHead = 0;
-        this.ftCount = 0;
-        this.prevTime = 0;
-        this.stats = { fps: 0, frameTime: 0, candidates: 0, dragLatency: 0 };
-
-        // ── Stats panel ──
-        this._buildStatsPanel();
-
-        // ── Init ──
-        this._initPool();
-        this._bindInput();
-        this._resize();
-
-        // Arrow function — bound once, reused every frame
-        this._raf = (now) => {
-            this._tick(now);
-            requestAnimationFrame(this._raf);
-        };
-
-        if (typeof ResizeObserver !== 'undefined') {
-            new ResizeObserver(() => this._resize()).observe(this.container);
+        // Allocate segment pool (<line> elements)
+        this.segments = [];
+        for (let i = 0; i < this.segmentPoolSize; i++) {
+            const el = document.createElementNS(ns, 'line');
+            el.setAttribute('stroke', this.color);
+            el.setAttribute('stroke-width', this.strokeWidth);
+            el.setAttribute('stroke-linecap', 'round');
+            el.style.opacity = '0';
+            this.svg.appendChild(el);
+            this.segments.push(el);
         }
-        window.addEventListener('resize', () => this._resize());
+
+        // Allocate arc pool (<path> elements)
+        this.arcs = [];
+        for (let i = 0; i < this.arcPoolSize; i++) {
+            const el = document.createElementNS(ns, 'path');
+            el.setAttribute('stroke', this.color);
+            el.setAttribute('stroke-width', this.strokeWidth);
+            el.setAttribute('stroke-linecap', 'round');
+            el.setAttribute('fill', 'none');
+            el.style.opacity = '0';
+            this.svg.appendChild(el);
+            this.arcs.push(el);
+        }
+
+        this.activeSegments = 0;
+        this.activeArcs = 0;
     }
 
-    // ── Public ──────────────────────────────────────────────────────────
+    /**
+     * Map draw commands to pool slots. Active slots get attributes + opacity 1.
+     * Inactive slots get opacity 0. CSS transition handles fade.
+     *
+     * @param {Array} commands — array of draw command objects
+     */
+    update(commands) {
+        let si = 0; // segment index
+        let ai = 0; // arc index
 
-    start(n = 500) {
-        this._generate(n);
-        this.prevTime = performance.now();
-        requestAnimationFrame(this._raf);
+        for (let i = 0; i < commands.length; i++) {
+            const cmd = commands[i];
+
+            if (cmd.type === 'clear') {
+                // Hide everything
+                for (let j = 0; j < this.segmentPoolSize; j++) {
+                    this.segments[j].style.opacity = '0';
+                }
+                for (let j = 0; j < this.arcPoolSize; j++) {
+                    this.arcs[j].style.opacity = '0';
+                }
+                si = 0;
+                ai = 0;
+                continue;
+            }
+
+            if (cmd.type === 'segment') {
+                if (si < this.segmentPoolSize) {
+                    const el = this.segments[si];
+                    el.setAttribute('x1', cmd.x1);
+                    el.setAttribute('y1', cmd.y1);
+                    el.setAttribute('x2', cmd.x2);
+                    el.setAttribute('y2', cmd.y2);
+                    el.style.opacity = '1';
+                    si++;
+                }
+                // Pool exhausted: silently skip
+                continue;
+            }
+
+            if (cmd.type === 'arc') {
+                if (ai < this.arcPoolSize) {
+                    const el = this.arcs[ai];
+                    el.setAttribute('d', arcToPath(
+                        cmd.cx, cmd.cy, cmd.r, cmd.startAngle, cmd.sweepAngle
+                    ));
+                    el.style.opacity = '1';
+                    ai++;
+                }
+                continue;
+            }
+        }
+
+        // Hide unused pool slots
+        for (let j = si; j < this.segmentPoolSize; j++) {
+            this.segments[j].style.opacity = '0';
+        }
+        for (let j = ai; j < this.arcPoolSize; j++) {
+            this.arcs[j].style.opacity = '0';
+        }
+
+        this.activeSegments = si;
+        this.activeArcs = ai;
     }
 
-    setEntityCount(n) {
-        this._generate(Math.max(1, Math.min(n | 0, CONFIG.MAX_ENTITIES)));
+    destroy() {
+        if (this.svg && this.svg.parentNode) {
+            this.svg.parentNode.removeChild(this.svg);
+        }
+        this.segments = [];
+        this.arcs = [];
+    }
+}
+
+/**
+ * Convert arc params to SVG path d-attribute.
+ * startAngle and sweepAngle in radians.
+ *
+ * SVG arcs cannot represent a full circle (start == end draws nothing),
+ * so near-full arcs are split into two halves.
+ */
+function arcToPath(cx, cy, r, startAngle, sweepAngle) {
+    const absSweep = Math.abs(sweepAngle);
+
+    // Full or near-full circle: split into two semicircles
+    if (absSweep > Math.PI * 1.999) {
+        const half = sweepAngle / 2;
+        const midAngle = startAngle + half;
+        const x1 = cx + r * Math.cos(startAngle);
+        const y1 = cy + r * Math.sin(startAngle);
+        const xm = cx + r * Math.cos(midAngle);
+        const ym = cy + r * Math.sin(midAngle);
+        const x2 = cx + r * Math.cos(startAngle + sweepAngle);
+        const y2 = cy + r * Math.sin(startAngle + sweepAngle);
+        const sf = sweepAngle > 0 ? 1 : 0;
+        return `M ${x1} ${y1} A ${r} ${r} 0 1 ${sf} ${xm} ${ym} A ${r} ${r} 0 1 ${sf} ${x2} ${y2}`;
+    }
+
+    const x1 = cx + r * Math.cos(startAngle);
+    const y1 = cy + r * Math.sin(startAngle);
+    const endAngle = startAngle + sweepAngle;
+    const x2 = cx + r * Math.cos(endAngle);
+    const y2 = cy + r * Math.sin(endAngle);
+    const largeArc = absSweep > Math.PI ? 1 : 0;
+    const sweepFlag = sweepAngle > 0 ? 1 : 0;
+    return `M ${x1} ${y1} A ${r} ${r} 0 ${largeArc} ${sweepFlag} ${x2} ${y2}`;
+}
+
+
+// ============================================================================
+// §2  TEST HARNESS — THROWAWAY CODE
+//
+// Simulates what the Rust sidecar does. Everything below this line gets
+// deleted when the real sidecar exists. Clearly separated from production.
+// ============================================================================
+
+// ── SDF functions ───────────────────────────────────────────────────────────
+
+function sdfRect(px, py, rx, ry, rw, rh) {
+    // Signed distance from point to rectangle boundary
+    const cx = rx + rw / 2;
+    const cy = ry + rh / 2;
+    const dx = Math.abs(px - cx) - rw / 2;
+    const dy = Math.abs(py - cy) - rh / 2;
+    const outside = Math.sqrt(Math.max(dx, 0) ** 2 + Math.max(dy, 0) ** 2);
+    const inside = Math.min(Math.max(dx, dy), 0);
+    return outside + inside;
+}
+
+function sdfCircle(px, py, cx, cy, r) {
+    return Math.sqrt((px - cx) ** 2 + (py - cy) ** 2) - r;
+}
+
+function sdfRoundedRect(px, py, rx, ry, rw, rh, cr) {
+    // SDF for rounded rectangle — shrink rect by corner radius, then offset
+    const cx = rx + rw / 2;
+    const cy = ry + rh / 2;
+    const hw = rw / 2 - cr;
+    const hh = rh / 2 - cr;
+    const dx = Math.max(Math.abs(px - cx) - hw, 0);
+    const dy = Math.max(Math.abs(py - cy) - hh, 0);
+    return Math.sqrt(dx * dx + dy * dy) - cr;
+}
+
+function sdfTriangle(px, py, x0, y0, x1, y1, x2, y2) {
+    // SDF for triangle — minimum distance to any edge segment
+    const d0 = distPointToSegment(px, py, x0, y0, x1, y1);
+    const d1 = distPointToSegment(px, py, x1, y1, x2, y2);
+    const d2 = distPointToSegment(px, py, x2, y2, x0, y0);
+    // Sign: positive outside, negative inside (cross product winding)
+    const sign = ((x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)) >= 0 &&
+                 ((x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)) >= 0 &&
+                 ((x0 - x2) * (py - y2) - (y0 - y2) * (px - x2)) >= 0 ? -1 : 1;
+    return sign * Math.min(d0, d1, d2);
+}
+
+function distPointToSegment(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const lenSq = dx * dx + dy * dy;
+    if (lenSq === 0) return Math.sqrt((px - x1) ** 2 + (py - y1) ** 2);
+    let t = ((px - x1) * dx + (py - y1) * dy) / lenSq;
+    t = Math.max(0, Math.min(1, t));
+    const cx = x1 + t * dx;
+    const cy = y1 + t * dy;
+    return Math.sqrt((px - cx) ** 2 + (py - cy) ** 2);
+}
+
+// ── Clip geometry ───────────────────────────────────────────────────────────
+
+/**
+ * Clip a line segment to the interior of a circle.
+ * Returns null or { x1, y1, x2, y2 } for the clipped sub-segment.
+ */
+function clipSegmentToCircle(sx1, sy1, sx2, sy2, cx, cy, cr) {
+    // Parametric: P(t) = S1 + t*(S2-S1), t in [0,1]
+    // |P(t) - C|^2 = cr^2 => quadratic in t
+    const dx = sx2 - sx1;
+    const dy = sy2 - sy1;
+    const fx = sx1 - cx;
+    const fy = sy1 - cy;
+
+    const a = dx * dx + dy * dy;
+    if (a < 1e-10) {
+        // Degenerate segment (zero length)
+        const d2 = fx * fx + fy * fy;
+        return d2 <= cr * cr ? { x1: sx1, y1: sy1, x2: sx2, y2: sy2 } : null;
+    }
+
+    const b = 2 * (fx * dx + fy * dy);
+    const c = fx * fx + fy * fy - cr * cr;
+    const disc = b * b - 4 * a * c;
+
+    if (disc < 0) {
+        // No intersection with circle boundary — segment fully inside or outside
+        const d2 = fx * fx + fy * fy;
+        return d2 <= cr * cr ? { x1: sx1, y1: sy1, x2: sx2, y2: sy2 } : null;
+    }
+
+    const sqrtDisc = Math.sqrt(disc);
+    let t0 = (-b - sqrtDisc) / (2 * a);
+    let t1 = (-b + sqrtDisc) / (2 * a);
+
+    // Clip t range to [0,1]
+    t0 = Math.max(0, t0);
+    t1 = Math.min(1, t1);
+
+    if (t0 >= t1) return null; // No valid sub-segment
+
+    return {
+        x1: sx1 + t0 * dx,
+        y1: sy1 + t0 * dy,
+        x2: sx1 + t1 * dx,
+        y2: sy1 + t1 * dy,
+    };
+}
+
+/**
+ * Clip an arc to the interior of a circle (flashlight).
+ * Arc defined by center (acx,acy), radius ar, startAngle, sweepAngle.
+ * Flashlight circle at (cx,cy) radius cr.
+ *
+ * Returns null or { cx, cy, r, startAngle, sweepAngle }.
+ */
+function clipArcToCircle(acx, acy, ar, startAngle, sweepAngle, cx, cy, cr) {
+    // Distance between arc center and flashlight center
+    const ddx = acx - cx;
+    const ddy = acy - cy;
+    const dist = Math.sqrt(ddx * ddx + ddy * ddy);
+
+    // If arc circle entirely inside flashlight — return full arc
+    if (dist + ar <= cr) {
+        return { cx: acx, cy: acy, r: ar, startAngle, sweepAngle };
+    }
+
+    // If no intersection at all
+    if (dist >= ar + cr || dist + cr <= ar) {
+        return null;
+    }
+
+    // Two-circle intersection: find the angle range on the arc circle
+    // that lies inside the flashlight circle
+    // cos(alpha) = (dist^2 + ar^2 - cr^2) / (2 * dist * ar)
+    const cosAlpha = (dist * dist + ar * ar - cr * cr) / (2 * dist * ar);
+    const alpha = Math.acos(Math.max(-1, Math.min(1, cosAlpha)));
+
+    // Angle from arc center to flashlight center
+    const centerAngle = Math.atan2(cy - acy, cx - acx);
+
+    // The arc's portion inside the flashlight is [centerAngle - alpha, centerAngle + alpha]
+    let insideStart = centerAngle - alpha;
+    let insideEnd = centerAngle + alpha;
+
+    // Normalize the original arc range
+    let arcStart = startAngle;
+    let arcEnd = startAngle + sweepAngle;
+
+    // Find overlap of [arcStart, arcEnd] with [insideStart, insideEnd]
+    // accounting for angle wrapping
+    const result = intersectAngleRanges(arcStart, arcEnd, insideStart, insideEnd);
+    if (result === null) return null;
+
+    return {
+        cx: acx,
+        cy: acy,
+        r: ar,
+        startAngle: result.start,
+        sweepAngle: result.end - result.start,
+    };
+}
+
+/**
+ * Intersect two angle ranges, handling wrap-around.
+ * Returns { start, end } or null.
+ */
+function intersectAngleRanges(aStart, aEnd, bStart, bEnd) {
+    // Normalize everything to a common reference
+    const TWO_PI = 2 * Math.PI;
+
+    // Try multiple offsets to handle wrapping
+    let best = null;
+    for (let offset = -TWO_PI; offset <= TWO_PI; offset += TWO_PI) {
+        const bs = bStart + offset;
+        const be = bEnd + offset;
+        const s = Math.max(aStart, bs);
+        const e = Math.min(aEnd, be);
+        if (e > s + 1e-6) {
+            if (best === null || (e - s) > (best.end - best.start)) {
+                best = { start: s, end: e };
+            }
+        }
+    }
+    return best;
+}
+
+// ── Shape generation ────────────────────────────────────────────────────────
+
+/**
+ * Generate shapes with deliberate overlap clustering.
+ * @param {number} count
+ * @param {number} width — container width
+ * @param {number} height — container height
+ * @param {number} density — 1 (spread) to 10 (pile-up)
+ * @returns {Array} shapes with edges
+ */
+function generateShapes(count, width, height, density) {
+    const shapes = [];
+    // Create cluster centers — more density = fewer, tighter clusters
+    const clusterCount = Math.max(2, Math.round(12 - density));
+    const clusters = [];
+    for (let i = 0; i < clusterCount; i++) {
+        clusters.push({
+            x: 80 + Math.random() * (width - 160),
+            y: 80 + Math.random() * (height - 160),
+        });
+    }
+
+    // Spread radius shrinks as density increases
+    const spread = (width * 0.4) * (1 - (density - 1) / 12);
+
+    for (let i = 0; i < count; i++) {
+        const roll = Math.random();
+        // Pick a random cluster center
+        const cluster = clusters[Math.floor(Math.random() * clusterCount)];
+        const ox = cluster.x + (Math.random() - 0.5) * 2 * spread;
+        const oy = cluster.y + (Math.random() - 0.5) * 2 * spread;
+
+        if (roll < 0.70) {
+            // Rectangle
+            const w = 40 + Math.random() * 160;
+            const h = 20 + Math.random() * 100;
+            const x = Math.max(0, Math.min(width - w, ox - w / 2));
+            const y = Math.max(0, Math.min(height - h, oy - h / 2));
+            shapes.push(makeRect(x, y, w, h));
+        } else if (roll < 0.85) {
+            // Rounded rectangle
+            const w = 50 + Math.random() * 150;
+            const h = 30 + Math.random() * 90;
+            const cr = 5 + Math.random() * 15;
+            const x = Math.max(0, Math.min(width - w, ox - w / 2));
+            const y = Math.max(0, Math.min(height - h, oy - h / 2));
+            shapes.push(makeRoundedRect(x, y, w, h, cr));
+        } else if (roll < 0.95) {
+            // Circle
+            const r = 15 + Math.random() * 60;
+            const cx = Math.max(r, Math.min(width - r, ox));
+            const cy = Math.max(r, Math.min(height - r, oy));
+            shapes.push(makeCircle(cx, cy, r));
+        } else {
+            // Triangle
+            const size = 30 + Math.random() * 80;
+            const cx = Math.max(size, Math.min(width - size, ox));
+            const cy = Math.max(size, Math.min(height - size, oy));
+            shapes.push(makeTriangle(cx, cy, size));
+        }
+    }
+
+    return shapes;
+}
+
+function makeRect(x, y, w, h) {
+    return {
+        kind: 'rect', x, y, w, h,
+        sdf: (px, py) => sdfRect(px, py, x, y, w, h),
+        edges: [
+            { type: 'segment', x1: x, y1: y, x2: x + w, y2: y },
+            { type: 'segment', x1: x + w, y1: y, x2: x + w, y2: y + h },
+            { type: 'segment', x1: x + w, y1: y + h, x2: x, y2: y + h },
+            { type: 'segment', x1: x, y1: y + h, x2: x, y2: y },
+        ],
+    };
+}
+
+function makeRoundedRect(x, y, w, h, cr) {
+    // Clamp corner radius
+    cr = Math.min(cr, w / 2, h / 2);
+    return {
+        kind: 'rrect', x, y, w, h, cr,
+        sdf: (px, py) => sdfRoundedRect(px, py, x, y, w, h, cr),
+        edges: [
+            // Top edge (between corners)
+            { type: 'segment', x1: x + cr, y1: y, x2: x + w - cr, y2: y },
+            // Right edge
+            { type: 'segment', x1: x + w, y1: y + cr, x2: x + w, y2: y + h - cr },
+            // Bottom edge
+            { type: 'segment', x1: x + w - cr, y1: y + h, x2: x + cr, y2: y + h },
+            // Left edge
+            { type: 'segment', x1: x, y1: y + h - cr, x2: x, y2: y + cr },
+            // Corner arcs (top-right, bottom-right, bottom-left, top-left)
+            { type: 'arc', cx: x + w - cr, cy: y + cr, r: cr, startAngle: -Math.PI / 2, sweepAngle: Math.PI / 2 },
+            { type: 'arc', cx: x + w - cr, cy: y + h - cr, r: cr, startAngle: 0, sweepAngle: Math.PI / 2 },
+            { type: 'arc', cx: x + cr, cy: y + h - cr, r: cr, startAngle: Math.PI / 2, sweepAngle: Math.PI / 2 },
+            { type: 'arc', cx: x + cr, cy: y + cr, r: cr, startAngle: Math.PI, sweepAngle: Math.PI / 2 },
+        ],
+    };
+}
+
+function makeCircle(cx, cy, r) {
+    return {
+        kind: 'circle', cx, cy, r,
+        sdf: (px, py) => sdfCircle(px, py, cx, cy, r),
+        edges: [
+            { type: 'arc', cx, cy, r, startAngle: 0, sweepAngle: 2 * Math.PI },
+        ],
+    };
+}
+
+function makeTriangle(cx, cy, size) {
+    // Equilateral triangle centered at (cx, cy)
+    const a = size * 0.577; // circumradius ≈ size / sqrt(3)
+    const x0 = cx, y0 = cy - a;
+    const x1 = cx - size / 2, y1 = cy + a / 2;
+    const x2 = cx + size / 2, y2 = cy + a / 2;
+    return {
+        kind: 'triangle', x0, y0, x1, y1, x2, y2,
+        sdf: (px, py) => sdfTriangle(px, py, x0, y0, x1, y1, x2, y2),
+        edges: [
+            { type: 'segment', x1: x0, y1: y0, x2: x1, y2: y1 },
+            { type: 'segment', x1: x1, y1: y1, x2: x2, y2: y2 },
+            { type: 'segment', x1: x2, y1: y2, x2: x0, y2: y0 },
+        ],
+    };
+}
+
+// ── Background baking ───────────────────────────────────────────────────────
+
+function bakeBackground(shapes, width, height) {
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+
+    // Dark base
+    ctx.fillStyle = '#0e0e12';
+    ctx.fillRect(0, 0, width, height);
+
+    for (const shape of shapes) {
+        ctx.fillStyle = '#1a1a24';
+        ctx.strokeStyle = '#2a2a3a';
+        ctx.lineWidth = 1;
+
+        if (shape.kind === 'rect') {
+            ctx.fillRect(shape.x, shape.y, shape.w, shape.h);
+            ctx.strokeRect(shape.x, shape.y, shape.w, shape.h);
+        } else if (shape.kind === 'rrect') {
+            drawRoundedRect(ctx, shape.x, shape.y, shape.w, shape.h, shape.cr);
+            ctx.fill();
+            ctx.stroke();
+        } else if (shape.kind === 'circle') {
+            ctx.beginPath();
+            ctx.arc(shape.cx, shape.cy, shape.r, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+        } else if (shape.kind === 'triangle') {
+            ctx.beginPath();
+            ctx.moveTo(shape.x0, shape.y0);
+            ctx.lineTo(shape.x1, shape.y1);
+            ctx.lineTo(shape.x2, shape.y2);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+        }
+    }
+
+    return canvas.toDataURL();
+}
+
+function drawRoundedRect(ctx, x, y, w, h, cr) {
+    ctx.beginPath();
+    ctx.moveTo(x + cr, y);
+    ctx.lineTo(x + w - cr, y);
+    ctx.arcTo(x + w, y, x + w, y + cr, cr);
+    ctx.lineTo(x + w, y + h - cr);
+    ctx.arcTo(x + w, y + h, x + w - cr, y + h, cr);
+    ctx.lineTo(x + cr, y + h);
+    ctx.arcTo(x, y + h, x, y + h - cr, cr);
+    ctx.lineTo(x, y + cr);
+    ctx.arcTo(x, y, x + cr, y, cr);
+    ctx.closePath();
+}
+
+// ── Test Harness ────────────────────────────────────────────────────────────
+
+class TestHarness {
+    constructor(containerId) {
+        this.container = document.getElementById(containerId);
+        this.shapes = [];
+        this.cursorX = 0;
+        this.cursorY = 0;
+        this.flashlightRadius = 120;
+        this.showCircle = true;
+        this.running = true;
+
+        // Pool sizes — generous for stress testing
+        this.segmentPoolSize = 256;
+        this.arcPoolSize = 64;
+
+        // Create overlay (production module)
+        this.overlay = new Overlay(this.container, {
+            segmentPoolSize: this.segmentPoolSize,
+            arcPoolSize: this.arcPoolSize,
+            color: '#00ff66',
+            strokeWidth: 2,
+        });
+
+        // Create flashlight circle SVG (harness only)
+        const ns = 'http://www.w3.org/2000/svg';
+        this.flashSvg = document.createElementNS(ns, 'svg');
+        this.flashSvg.setAttribute('class', 'flashlight-svg');
+        this.container.appendChild(this.flashSvg);
+
+        this.flashCircle = document.createElementNS(ns, 'circle');
+        this.flashCircle.setAttribute('stroke', '#ffcc00');
+        this.flashCircle.setAttribute('stroke-width', '1.5');
+        this.flashCircle.setAttribute('fill', 'none');
+        this.flashCircle.setAttribute('stroke-opacity', '0.6');
+        this.flashSvg.appendChild(this.flashCircle);
+
+        // Perf stats
+        this.perfEl = document.getElementById('perf');
+        this.frameTimes = [];
+        this.sdfTimes = [];
+        this.clipTimes = [];
+        this.svgTimes = [];
+        this.segCounts = [];
+        this.arcCounts = [];
+        this.rollingWindow = 60;
+
+        // Bind cursor
+        this.container.addEventListener('mousemove', (e) => {
+            const rect = this.container.getBoundingClientRect();
+            this.cursorX = e.clientX - rect.left;
+            this.cursorY = e.clientY - rect.top;
+        });
+
+        // Start rAF loop
+        this._lastFrame = performance.now();
+        this._raf = requestAnimationFrame((t) => this._loop(t));
+    }
+
+    regenerate(count, density) {
+        const w = this.container.clientWidth;
+        const h = this.container.clientHeight;
+        this.shapes = generateShapes(count, w, h, density);
+
+        // Bake background
+        const dataUrl = bakeBackground(this.shapes, w, h);
+        this.container.style.backgroundImage = `url(${dataUrl})`;
     }
 
     setFlashlightRadius(r) {
-        CONFIG.FLASHLIGHT_RADIUS = Math.max(20, Math.min(r | 0, 600));
+        this.flashlightRadius = r;
     }
 
-    // ── Server connection ────────────────────────────────────────────
-
-    connect(url) {
-        this.prevTime = performance.now();
-        requestAnimationFrame(this._raf);
-
-        this._wsConnect(url);
+    setShowCircle(show) {
+        this.showCircle = show;
+        this.flashSvg.style.display = show ? '' : 'none';
     }
 
-    _wsConnect(url) {
-        const ws = new WebSocket(url);
-        ws.binaryType = 'arraybuffer';
+    _loop(now) {
+        if (!this.running) return;
 
-        ws.onopen = () => {
-            console.log('[IRONCLAD] connected to', url);
-            this.connected = true;
-        };
+        const frameStart = performance.now();
+        const radius = this.flashlightRadius;
+        const mx = this.cursorX;
+        const my = this.cursorY;
 
-        ws.onmessage = (e) => {
-            if (!(e.data instanceof ArrayBuffer)) return;
-            this._handleBinary(new DataView(e.data), e.data);
-        };
-
-        ws.onclose = () => {
-            console.log('[IRONCLAD] disconnected, reconnecting in 2s...');
-            this.connected = false;
-            this.ws_conn = null;
-            setTimeout(() => this._wsConnect(url), 2000);
-        };
-
-        ws.onerror = () => {}; // onclose fires after onerror
-
-        this.ws_conn = ws;
-    }
-
-    _handleBinary(view, buffer) {
-        if (view.byteLength < 1) return;
-        const type = view.getUint8(0);
-
-        switch (type) {
-            case WIRE.SNAPSHOT:         this._onSnapshot(view, buffer); break;
-            case WIRE.TASK_CREATED:     this._onTaskCreated(view, buffer); break;
-            case WIRE.TASK_SCHEDULED:   // fall through — same as moved
-            case WIRE.TASK_MOVED:       this._onTaskMoved(view); break;
-            case WIRE.TASK_UNSCHEDULED: this._onTaskRemoveFromGrid(view); break;
-            case WIRE.TASK_COMPLETED:   this._onTaskRemoveFromGrid(view); break;
-            case WIRE.TASK_DELETED:     this._onTaskDeleted(view); break;
-            default:
-                console.warn('[IRONCLAD] unknown message type:', type);
-        }
-    }
-
-    // ── Snapshot: populate all SoA arrays from server state ──────────
-
-    _onSnapshot(view, buffer) {
-        const rev       = Number(view.getBigUint64(1, true));
-        const taskCount = view.getUint32(9, true);
-        const svcCount  = view.getUint32(13, true);
-
-        this.revision = rev;
-
-        // Parse tasks — only show Scheduled (1) and Active (2) on the grid
-        let idx = 0;
-        const base = WIRE.SNAPSHOT_HEADER;
-
-        for (let t = 0; t < taskCount; t++) {
-            const off = base + t * WIRE.TASK_STRIDE;
-            const status = view.getUint8(off + WIRE.TASK_STATUS);
-            const date = view.getUint16(off + WIRE.TASK_DATE, true);
-
-            // Skip staged (date=0xFFFF) and completed tasks
-            if (date === 0xFFFF || status === 3) continue;
-
-            this._loadTaskRecord(view, buffer, off, idx);
-            idx++;
+        // Update flashlight circle
+        if (this.showCircle) {
+            this.flashCircle.setAttribute('cx', mx);
+            this.flashCircle.setAttribute('cy', my);
+            this.flashCircle.setAttribute('r', radius);
         }
 
-        this.count = idx;
-
-        // Grab the first service ID for double-click create
-        if (svcCount > 0) {
-            const svcOff = base + taskCount * WIRE.TASK_STRIDE;
-            this.defaultServiceId = new Uint8Array(buffer, svcOff + WIRE.SVC_ID, 16).slice();
-        }
-
-        this._rebuildIndex();
-        this.dirty = true;
-        this.prevMX = -9999; // force flashlight refresh
-        for (let i = 0; i < this.pool.length; i++) this.pool[i].style.display = 'none';
-
-        console.log(`[IRONCLAD] snapshot: rev=${rev}, ${taskCount} tasks (${idx} on grid), ${svcCount} services`);
-    }
-
-    // ── Load one task record into SoA slot ──────────────────────────
-
-    _loadTaskRecord(view, buffer, off, idx) {
-        const date      = view.getUint16(off + WIRE.TASK_DATE, true);
-        const startTime = view.getUint16(off + WIRE.TASK_START_TIME, true);
-        const duration  = view.getUint16(off + WIRE.TASK_DURATION, true);
-        const priority  = view.getUint8(off + WIRE.TASK_PRIORITY);
-
-        // Store UUID and service UUID (16 bytes each)
-        const uuidOff = idx * 16;
-        this.uuids.set(new Uint8Array(buffer, off + WIRE.TASK_ID, 16), uuidOff);
-        this.serviceIds.set(new Uint8Array(buffer, off + WIRE.TASK_SERVICE_ID, 16), uuidOff);
-        this.priorities[idx] = priority;
-
-        // Derive column (0=Mon..6=Sun) from epoch days: Jan 1 1970 = Thursday = day 3
-        const col = (date + 3) % 7;
-
-        // Store raw epoch date for monthly view
-        this.dates[idx] = date;
-
-        // Convert scheduling data to pixel coordinates
-        const pad = 10;
-        this.ids[idx]  = idx;
-        this.xs[idx]   = CONFIG.LEFT_GUTTER + col * CONFIG.DAY_WIDTH + pad;
-        this.ys[idx]   = CONFIG.TOP_HEADER + ((startTime / 60) - CONFIG.START_HOUR) * CONFIG.HOUR_HEIGHT;
-        this.ws[idx]   = CONFIG.DAY_WIDTH - pad * 2;
-        this.hs[idx]   = (duration / 60) * CONFIG.HOUR_HEIGHT;
-        this.types[idx] = priority >= 3 ? 2 : priority >= 2 ? 1 : 0;
-
-        // Decode title from zero-padded UTF-8
-        const titleBytes = new Uint8Array(buffer, off + WIRE.TASK_TITLE, 128);
-        let titleEnd = 0;
-        while (titleEnd < 128 && titleBytes[titleEnd] !== 0) titleEnd++;
-        const title = new TextDecoder().decode(titleBytes.subarray(0, titleEnd));
-
-        this.labels[idx] = [title, '', '', '', ''];
-    }
-
-    // ── Delta: TaskCreated → add to grid if scheduled ───────────────
-
-    _onTaskCreated(view, buffer) {
-        const rev = Number(view.getBigUint64(1, true));
-        this.revision = rev;
-
-        // Task record starts at offset 9 (after type + revision)
-        const off = 9;
-        const status = view.getUint8(off + WIRE.TASK_STATUS);
-        const date = view.getUint16(off + WIRE.TASK_DATE, true);
-
-        // Only add to grid if scheduled
-        if (date === 0xFFFF || status === 3) return;
-
-        const idx = this.count;
-        this._loadTaskRecord(view, buffer, off, idx);
-        this.count++;
-        this._rebuildIndex();
-        this.dirty = true;
-    }
-
-    // ── Delta: TaskScheduled / TaskMoved → update position ──────────
-
-    _onTaskMoved(view) {
-        const rev = Number(view.getBigUint64(1, true));
-        this.revision = rev;
-
-        const uuidBytes = new Uint8Array(view.buffer, view.byteOffset + 9, 16);
-        const idx = this._findByUuid(uuidBytes);
-
-        const date      = view.getUint16(25, true);  // [25..27]
-        const startTime = view.getUint16(27, true);  // [27..29]
-        const duration  = view.getUint16(29, true);  // [29..31]
-        const col       = (date + 3) % 7;            // epoch days → column (0=Mon..6=Sun)
-
-        if (idx === -1) {
-            // Task was staged, now scheduled — need to add it
-            // Build a minimal task record in the SoA arrays
-            const newIdx = this.count;
-            const pad = 10;
-            this.uuids.set(uuidBytes, newIdx * 16);
-            this.ids[newIdx]   = newIdx;
-            this.dates[newIdx] = date;
-            this.xs[newIdx]    = CONFIG.LEFT_GUTTER + col * CONFIG.DAY_WIDTH + pad;
-            this.ys[newIdx]    = CONFIG.TOP_HEADER + ((startTime / 60) - CONFIG.START_HOUR) * CONFIG.HOUR_HEIGHT;
-            this.ws[newIdx]    = CONFIG.DAY_WIDTH - pad * 2;
-            this.hs[newIdx]    = (duration / 60) * CONFIG.HOUR_HEIGHT;
-            this.types[newIdx] = 0;
-            this.labels[newIdx] = ['(new task)', '', '', '', ''];
-            this.count++;
-        } else {
-            const pad = 10;
-            this.dates[idx] = date;
-            this.xs[idx] = CONFIG.LEFT_GUTTER + col * CONFIG.DAY_WIDTH + pad;
-            this.ys[idx] = CONFIG.TOP_HEADER + ((startTime / 60) - CONFIG.START_HOUR) * CONFIG.HOUR_HEIGHT;
-            this.hs[idx] = (duration / 60) * CONFIG.HOUR_HEIGHT;
-        }
-
-        this._rebuildIndex();
-        this.dirty = true;
-    }
-
-    // ── Delta: Unschedule/Complete → remove from grid ───────────────
-
-    _onTaskRemoveFromGrid(view) {
-        const rev = Number(view.getBigUint64(1, true));
-        this.revision = rev;
-
-        const uuidBytes = new Uint8Array(view.buffer, view.byteOffset + 9, 16);
-        const idx = this._findByUuid(uuidBytes);
-        if (idx === -1) return;
-
-        this._swapRemove(idx);
-        this._rebuildIndex();
-        this.dirty = true;
-    }
-
-    // ── Delta: TaskDeleted → remove from grid ───────────────────────
-
-    _onTaskDeleted(view) {
-        const rev = Number(view.getBigUint64(1, true));
-        this.revision = rev;
-
-        const uuidBytes = new Uint8Array(view.buffer, view.byteOffset + 9, 16);
-        const idx = this._findByUuid(uuidBytes);
-        if (idx === -1) return;
-
-        this._swapRemove(idx);
-        this._rebuildIndex();
-        this.dirty = true;
-    }
-
-    // ── Send MoveTask command to server ─────────────────────────────
-
-    _sendMoveTask(entityIdx) {
-        if (!this.ws_conn || this.ws_conn.readyState !== WebSocket.OPEN) return;
-
-        // Convert pixel position back to scheduling data
-        const col = Math.round((this.xs[entityIdx] - CONFIG.LEFT_GUTTER - 10) / CONFIG.DAY_WIDTH);
-        const clampedCol = Math.max(0, Math.min(col, CONFIG.DAYS - 1));
-        const date = this._weekStart() + clampedCol; // epoch days
-
-        const relMinutes = ((this.ys[entityIdx] - CONFIG.TOP_HEADER) / CONFIG.HOUR_HEIGHT + CONFIG.START_HOUR) * 60;
-        const startTime = Math.round(relMinutes / 15) * 15;
-
-        const relDur = (this.hs[entityIdx] / CONFIG.HOUR_HEIGHT) * 60;
-        const duration = Math.max(15, Math.round(relDur / 15) * 15);
-
-        // Pack: [type:u8][task_id:16][date:u16 LE][start_time:u16 LE][duration:u16 LE]
-        const buf = new ArrayBuffer(23);
-        const v = new DataView(buf);
-        const arr = new Uint8Array(buf);
-
-        arr[0] = WIRE.CMD_MOVE_TASK;
-        arr.set(this.uuids.subarray(entityIdx * 16, entityIdx * 16 + 16), 1);
-        v.setUint16(17, date, true);
-        v.setUint16(19, startTime, true);
-        v.setUint16(21, duration, true);
-
-        this.ws_conn.send(buf);
-    }
-
-    // ── Send CreateTask command to server ──────────────────────────
-
-    // title/priority/serviceId are optional — used when cloning an existing task.
-    // Defaults: 'New task', Medium priority, defaultServiceId.
-    // date is epoch days (u16); use 0xFFFF for staged, or _weekStart()+col for grid.
-    _sendCreateTask(date, startTime, duration, title, priority, serviceId) {
-        if (!this.ws_conn || this.ws_conn.readyState !== WebSocket.OPEN) return;
-        if (!this.defaultServiceId) return;
-
-        const titleStr   = title    !== undefined ? title    : 'New task';
-        const prio       = priority !== undefined ? priority : 1; // Medium
-        const svcId      = serviceId !== undefined ? serviceId : this.defaultServiceId;
-
-        const titleBytes = new TextEncoder().encode(titleStr);
-
-        // Pack: [type:u8][priority:u8][service_id:16][assigned_to:16][date:u16 LE][start:u16][dur:u16][title...]
-        const buf = new ArrayBuffer(40 + titleBytes.length);
-        const v = new DataView(buf);
-        const arr = new Uint8Array(buf);
-
-        arr[0] = WIRE.CMD_CREATE_TASK;
-        arr[1] = prio;
-        arr.set(svcId, 2);                        // service_id at [2..18]
-        // assigned_to at [18..34] stays zeroed (none)
-        v.setUint16(34, date, true);              // date (u16 LE epoch days, 0xFFFF = staged)
-        v.setUint16(36, startTime, true);         // start_time
-        v.setUint16(38, duration, true);          // duration
-        arr.set(titleBytes, 40);                  // title
-
-        this.ws_conn.send(buf);
-    }
-
-    // ── Helpers ──────────────────────────────────────────────────────
-
-    // Returns epoch days (UTC, since 1970-01-01) for the Monday of the current week.
-    // Used to convert grid columns (0=Mon..6=Sun) to absolute epoch dates.
-    _weekStart() {
-        const utcDayOfWeek = (new Date().getUTCDay() + 6) % 7; // 0=Mon..6=Sun
-        const utcEpochDays = Math.floor(Date.now() / 86400000);
-        return utcEpochDays - utcDayOfWeek;
-    }
-
-    _findByUuid(uuidBytes) {
-        for (let i = 0; i < this.count; i++) {
-            const off = i * 16;
-            let match = true;
-            for (let b = 0; b < 16; b++) {
-                if (this.uuids[off + b] !== uuidBytes[b]) { match = false; break; }
-            }
-            if (match) return i;
-        }
-        return -1;
-    }
-
-    _swapRemove(idx) {
-        const last = this.count - 1;
-        if (idx !== last) {
-            // Copy last entity into the removed slot
-            this.ids[idx]        = this.ids[last];
-            this.xs[idx]         = this.xs[last];
-            this.ys[idx]         = this.ys[last];
-            this.ws[idx]         = this.ws[last];
-            this.hs[idx]         = this.hs[last];
-            this.types[idx]      = this.types[last];
-            this.priorities[idx] = this.priorities[last];
-            this.dates[idx]      = this.dates[last];
-            this.labels[idx]     = this.labels[last];
-            this.uuids.copyWithin(idx * 16, last * 16, last * 16 + 16);
-            this.serviceIds.copyWithin(idx * 16, last * 16, last * 16 + 16);
-        }
-        this.count--;
-    }
-
-    // ── Pool ────────────────────────────────────────────────────────────
-
-    _initPool() {
-        for (let i = 0; i < CONFIG.POOL_SIZE; i++) {
-            const d = document.createElement('div');
-            d.className = 'proxy';
-            d.style.cssText =
-                'position:absolute;display:none;box-sizing:border-box;' +
-                'border:2px solid #00ffcc;background:rgba(0,255,204,0.06);' +
-                'cursor:grab;z-index:10;will-change:transform;' +
-                'border-radius:3px;';
-            this.container.appendChild(d);
-            this.pool.push(d);
-        }
-    }
-
-    // ── Spatial index ───────────────────────────────────────────────────
-
-    _rebuildIndex() {
-        for (let b = 0; b < CONFIG.MAX_BUCKETS; b++) this.buckets[b].length = 0;
-
-        for (let i = 0; i < this.count; i++) {
-            const b0 = (this.xs[i] / CONFIG.BUCKET_WIDTH) | 0;
-            const b1 = ((this.xs[i] + this.ws[i]) / CONFIG.BUCKET_WIDTH) | 0;
-            for (let b = b0; b <= b1; b++) {
-                if (b >= 0 && b < CONFIG.MAX_BUCKETS) this.buckets[b].push(i);
+        // ── SDF evaluation ──────────────────────────────────────────────
+        const sdfStart = performance.now();
+        const nearShapes = [];
+        for (let i = 0; i < this.shapes.length; i++) {
+            const shape = this.shapes[i];
+            const d = shape.sdf(mx, my);
+            // Shape boundary within flashlight radius (with margin for edge thickness)
+            if (Math.abs(d) < radius + 10) {
+                nearShapes.push(shape);
             }
         }
-    }
+        const sdfTime = performance.now() - sdfStart;
 
-    // ── Tick ────────────────────────────────────────────────────────────
+        // ── Clip geometry ───────────────────────────────────────────────
+        const clipStart = performance.now();
+        const commands = [];
 
-    _tick(now) {
-        const dt = now - this.prevTime;
-        this.prevTime = now;
+        for (let i = 0; i < nearShapes.length; i++) {
+            const shape = nearShapes[i];
+            const edges = shape.edges;
 
-        this.frameTimes[this.ftHead] = dt;
-        this.ftHead = (this.ftHead + 1) % 60;
-        if (this.ftCount < 60) this.ftCount++;
+            for (let j = 0; j < edges.length; j++) {
+                const edge = edges[j];
 
-        const moved = this.mouseX !== this.prevMX || this.mouseY !== this.prevMY;
-        if (moved || this.dragIdx >= 0) {
-            if (this.viewMode === 'week') this._flashlight();
-            this.prevMX = this.mouseX;
-            this.prevMY = this.mouseY;
-        }
-
-        if (this.dirty) {
-            if (this.viewMode === 'month') {
-                this._renderMonth();
-            } else {
-                this._render();
-            }
-            this.dirty = false;
-        }
-
-        if (this.dragIdx >= 0 && this.dragInputTime > 0) {
-            this.stats.dragLatency = performance.now() - this.dragInputTime;
-        }
-
-        this._showStats();
-    }
-
-    // ── Flashlight ──────────────────────────────────────────────────────
-
-    _flashlight() {
-        this.candidateCount = 0;
-        this.currentFrame++;
-
-        const rSq = CONFIG.FLASHLIGHT_RADIUS * CONFIG.FLASHLIGHT_RADIUS;
-        const cb = (this.mouseX / CONFIG.BUCKET_WIDTH) | 0;
-
-        for (let b = cb - 1; b <= cb + 1; b++) {
-            if (b < 0 || b >= CONFIG.MAX_BUCKETS) continue;
-            const bk = this.buckets[b];
-            for (let j = 0, len = bk.length; j < len; j++) {
-                const i = bk[j];
-
-                if (this.frameStamp[i] === this.currentFrame) continue;
-                this.frameStamp[i] = this.currentFrame;
-
-                // SDF: distance from cursor to nearest point on rect edge
-                // 0 when cursor is inside the rect, positive outside
-                const dx = Math.max(this.xs[i] - this.mouseX, this.mouseX - this.xs[i] - this.ws[i], 0);
-                const dy = Math.max(this.ys[i] - this.mouseY, this.mouseY - this.ys[i] - this.hs[i], 0);
-                const dSq = dx * dx + dy * dy;
-
-                if (dSq <= rSq) {
-                    const c = this.candidateCount++;
-                    this.candidateIdx[c] = i;
-                    this.candidateDist[c] = dSq;
-                }
-            }
-        }
-
-        this.stats.candidates = this.candidateCount;
-
-        // Insertion sort — typically <50 candidates
-        for (let i = 1; i < this.candidateCount; i++) {
-            const kd = this.candidateDist[i];
-            const ki = this.candidateIdx[i];
-            let j = i - 1;
-            while (j >= 0 && this.candidateDist[j] > kd) {
-                this.candidateDist[j + 1] = this.candidateDist[j];
-                this.candidateIdx[j + 1] = this.candidateIdx[j];
-                j--;
-            }
-            this.candidateDist[j + 1] = kd;
-            this.candidateIdx[j + 1] = ki;
-        }
-
-        const n = Math.min(this.candidateCount, CONFIG.POOL_SIZE);
-        for (let i = 0; i < CONFIG.POOL_SIZE; i++) {
-            const p = this.pool[i];
-            if (i < n) {
-                const idx = this.candidateIdx[i];
-                if (p.dataset.idx !== String(idx)) {
-                    p.dataset.idx = String(idx);
-                    p.style.width = this.ws[idx] + 'px';
-                    p.style.height = this.hs[idx] + 'px';
-                }
-                p.style.transform = `translate(${this.xs[idx]}px,${this.ys[idx]}px)`;
-                if (p.style.display !== 'block') p.style.display = 'block';
-
-                // Cursor hint: copy if Alt held, ns-resize near edges, grab elsewhere
-                if (this.dragIdx < 0) {
-                    const nearTop = Math.abs(this.mouseY - this.ys[idx]) < 8;
-                    const nearBot = Math.abs(this.mouseY - (this.ys[idx] + this.hs[idx])) < 8;
-                    p.style.cursor = (nearTop || nearBot) ? 'ns-resize' : 'grab';
-                }
-            } else {
-                if (p.style.display !== 'none') p.style.display = 'none';
-            }
-        }
-    }
-
-    // ── Monthly calendar render (Alt-M, read-only) ─────────────────────
-
-    _renderMonth() {
-        const W = this.canvas.width;
-        const H = this.canvas.height;
-        const ctx = this.ctx;
-        const dpr = this.dpr;
-
-        ctx.fillStyle = '#0a0a0e';
-        ctx.fillRect(0, 0, W, H);
-        ctx.save();
-        ctx.scale(dpr, dpr);
-
-        const lw = W / dpr;
-        const lh = H / dpr;
-
-        // ── Month bounds ──────────────────────────────────────────────────
-        const today     = Math.floor(Date.now() / 86400000); // UTC epoch days
-        const todayDate = new Date(today * 86400000);
-        const year      = todayDate.getUTCFullYear();
-        const month     = todayDate.getUTCMonth(); // 0-indexed
-
-        const firstDay = Math.floor(Date.UTC(year, month, 1)     / 86400000);
-        const lastDay  = Math.floor(Date.UTC(year, month + 1, 0) / 86400000);
-
-        // Grid starts on the Monday of the week containing firstDay
-        const firstDow  = (firstDay + 3) % 7; // 0=Mon..6=Sun
-        const gridStart = firstDay - firstDow;
-
-        // Grid ends on the Sunday of the week containing lastDay
-        const lastDow = (lastDay + 3) % 7;
-        const gridEnd = lastDay + (6 - lastDow);
-
-        const numWeeks = (gridEnd - gridStart + 1) / 7;
-
-        // ── Layout ────────────────────────────────────────────────────────
-        const TITLE_H  = 30;
-        const LABEL_H  = 22;
-        const HEADER_H = TITLE_H + LABEL_H;
-        const cellW    = lw / 7;
-        const cellH    = (lh - HEADER_H) / numWeeks;
-        const CELL_PAD = 4;
-        const BAR_H    = 14;
-        const BAR_GAP  = 2;
-        const maxBars  = Math.max(1, Math.floor((cellH - 22) / (BAR_H + BAR_GAP)));
-
-        const MONTH_NAMES = ['January','February','March','April','May','June',
-                             'July','August','September','October','November','December'];
-
-        // ── Month title ───────────────────────────────────────────────────
-        ctx.fillStyle   = '#00ffcc';
-        ctx.font        = '700 13px monospace';
-        ctx.textAlign   = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(MONTH_NAMES[month].toUpperCase() + ' ' + year, lw / 2, TITLE_H / 2);
-
-        // ── Day-of-week labels ────────────────────────────────────────────
-        ctx.fillStyle = '#555';
-        ctx.font      = '600 11px monospace';
-        for (let d = 0; d < 7; d++) {
-            ctx.fillText(DAY_LABELS[d], d * cellW + cellW / 2, TITLE_H + LABEL_H / 2);
-        }
-
-        // ── Build per-day task lookup ─────────────────────────────────────
-        const tasksByDay = new Map();
-        for (let i = 0; i < this.count; i++) {
-            const d = this.dates[i];
-            if (d === 0xFFFF) continue;
-            if (!tasksByDay.has(d)) tasksByDay.set(d, []);
-            tasksByDay.get(d).push(i);
-        }
-
-        // ── Draw grid cells ───────────────────────────────────────────────
-        ctx.textBaseline = 'top';
-
-        for (let w = 0; w < numWeeks; w++) {
-            for (let d = 0; d < 7; d++) {
-                const epochDay = gridStart + w * 7 + d;
-                const cx = d * cellW;
-                const cy = HEADER_H + w * cellH;
-                const inMonth = epochDay >= firstDay && epochDay <= lastDay;
-                const isToday = epochDay === today;
-
-                // Background
-                ctx.fillStyle = inMonth ? '#0e0e16' : '#0a0a0e';
-                ctx.fillRect(cx, cy, cellW, cellH);
-                if (isToday) {
-                    ctx.fillStyle = 'rgba(0,255,204,0.05)';
-                    ctx.fillRect(cx, cy, cellW, cellH);
-                }
-
-                // Cell border
-                ctx.strokeStyle = isToday ? '#1e3a3a' : '#16161e';
-                ctx.lineWidth = 1;
-                ctx.strokeRect(cx + 0.5, cy + 0.5, cellW - 1, cellH - 1);
-
-                // Day number
-                const dayNum = new Date(epochDay * 86400000).getUTCDate();
-                ctx.font      = isToday ? '700 11px monospace' : '11px monospace';
-                ctx.fillStyle = isToday ? '#00ffcc' : inMonth ? '#555' : '#2a2a35';
-                ctx.textAlign = 'right';
-                ctx.fillText(String(dayNum), cx + cellW - CELL_PAD, cy + CELL_PAD);
-
-                // Task bars
-                const tasks = tasksByDay.get(epochDay);
-                if (!tasks) continue;
-
-                let barY = cy + 20;
-                for (let t = 0; t < Math.min(tasks.length, maxBars); t++) {
-                    // Overflow indicator on last visible slot
-                    if (t === maxBars - 1 && tasks.length > maxBars) {
-                        ctx.fillStyle   = '#444';
-                        ctx.font        = '10px monospace';
-                        ctx.textAlign   = 'left';
-                        ctx.textBaseline = 'middle';
-                        ctx.fillText('+' + (tasks.length - maxBars + 1) + ' more', cx + CELL_PAD, barY + BAR_H / 2);
-                        ctx.textBaseline = 'top';
-                        break;
+                if (edge.type === 'segment') {
+                    const clipped = clipSegmentToCircle(
+                        edge.x1, edge.y1, edge.x2, edge.y2,
+                        mx, my, radius
+                    );
+                    if (clipped) {
+                        commands.push({
+                            type: 'segment',
+                            x1: clipped.x1, y1: clipped.y1,
+                            x2: clipped.x2, y2: clipped.y2,
+                        });
                     }
-
-                    const ti   = tasks[t];
-                    const type = this.types[ti];
-                    const barX = cx + CELL_PAD;
-                    const barW = cellW - CELL_PAD * 2;
-
-                    ctx.fillStyle   = TYPE_COLORS[type][0];
-                    ctx.fillRect(barX, barY, barW, BAR_H);
-                    ctx.strokeStyle = TYPE_COLORS[type][1];
-                    ctx.lineWidth   = 1;
-                    ctx.strokeRect(barX + 0.5, barY + 0.5, barW - 1, BAR_H - 1);
-
-                    // Title — clipped to bar
-                    ctx.save();
-                    ctx.beginPath();
-                    ctx.rect(barX + 2, barY, barW - 4, BAR_H);
-                    ctx.clip();
-                    ctx.fillStyle   = '#ccc';
-                    ctx.font        = '10px -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif';
-                    ctx.textAlign   = 'left';
-                    ctx.textBaseline = 'middle';
-                    ctx.fillText(this.labels[ti][0], barX + 3, barY + BAR_H / 2);
-                    ctx.restore();
-
-                    barY += BAR_H + BAR_GAP;
+                } else if (edge.type === 'arc') {
+                    const clipped = clipArcToCircle(
+                        edge.cx, edge.cy, edge.r,
+                        edge.startAngle, edge.sweepAngle,
+                        mx, my, radius
+                    );
+                    if (clipped) {
+                        commands.push({
+                            type: 'arc',
+                            cx: clipped.cx, cy: clipped.cy, r: clipped.r,
+                            startAngle: clipped.startAngle,
+                            sweepAngle: clipped.sweepAngle,
+                        });
+                    }
                 }
             }
         }
+        const clipTime = performance.now() - clipStart;
 
-        ctx.restore();
+        // ── SVG update ──────────────────────────────────────────────────
+        const svgStart = performance.now();
+        this.overlay.update(commands);
+        const svgTime = performance.now() - svgStart;
+
+        const frameTime = performance.now() - frameStart;
+
+        // ── Rolling perf stats ──────────────────────────────────────────
+        this.frameTimes.push(frameTime);
+        this.sdfTimes.push(sdfTime);
+        this.clipTimes.push(clipTime);
+        this.svgTimes.push(svgTime);
+        this.segCounts.push(this.overlay.activeSegments);
+        this.arcCounts.push(this.overlay.activeArcs);
+
+        if (this.frameTimes.length > this.rollingWindow) {
+            this.frameTimes.shift();
+            this.sdfTimes.shift();
+            this.clipTimes.shift();
+            this.svgTimes.shift();
+            this.segCounts.shift();
+            this.arcCounts.shift();
+        }
+
+        // Update display every 10 frames
+        if (this.frameTimes.length % 10 === 0) {
+            this._updatePerfDisplay(now);
+        }
+
+        this._lastFrame = now;
+        this._raf = requestAnimationFrame((t) => this._loop(t));
     }
 
-    // ── Canvas render ───────────────────────────────────────────────────
+    _updatePerfDisplay(now) {
+        const avg = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+        const avgFrame = avg(this.frameTimes);
+        const avgSdf = avg(this.sdfTimes);
+        const avgClip = avg(this.clipTimes);
+        const avgSvg = avg(this.svgTimes);
+        const avgSegs = Math.round(avg(this.segCounts));
+        const avgArcs = Math.round(avg(this.arcCounts));
 
-    _render() {
-        const W = this.canvas.width;
-        const H = this.canvas.height;
-        const ctx = this.ctx;
-        const dpr = this.dpr;
+        // FPS from actual frame intervals (rAF-based)
+        const fps = avgFrame > 0 ? Math.min(999, 1000 / (avgFrame + (1000 / 60 - avgFrame))) : 0;
+        // Better FPS: use rAF timing
+        const realFps = this._fpsFromRaf(now);
 
-        ctx.fillStyle = '#0e0e12';
-        ctx.fillRect(0, 0, W, H);
-        ctx.save();
-        ctx.scale(dpr, dpr);
-
-        const lw = W / dpr;
-        const lh = H / dpr;
-        const gx = CONFIG.LEFT_GUTTER;
-        const gy = CONFIG.TOP_HEADER;
-        const dw = CONFIG.DAY_WIDTH;
-        const hh = CONFIG.HOUR_HEIGHT;
-        const gridR = gx + CONFIG.DAYS * dw;
-        const gridB = gy + HOURS * hh;
-
-        // Day headers
-        ctx.fillStyle = '#999';
-        ctx.font = '600 11px monospace';
-        ctx.textAlign = 'center';
-        for (let d = 0; d < CONFIG.DAYS; d++) {
-            ctx.fillText(DAY_LABELS[d], gx + d * dw + dw * 0.5, gy - 10);
-        }
-
-        // Hour labels
-        ctx.fillStyle = '#555';
-        ctx.font = '10px monospace';
-        ctx.textAlign = 'right';
-        for (let h = 0; h <= HOURS; h++) {
-            const label = String(CONFIG.START_HOUR + h).padStart(2, '0') + ':00';
-            ctx.fillText(label, gx - 8, gy + h * hh + 4);
-        }
-
-        // Hour grid lines
-        ctx.strokeStyle = '#252530';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        for (let h = 0; h <= HOURS; h++) {
-            const y = gy + h * hh + 0.5;
-            ctx.moveTo(gx, y);
-            ctx.lineTo(gridR, y);
-        }
-        ctx.stroke();
-
-        // 15-min sub-lines
-        ctx.strokeStyle = '#18181f';
-        ctx.beginPath();
-        for (let h = 0; h < HOURS; h++) {
-            for (let q = 1; q < 4; q++) {
-                const y = gy + h * hh + q * SNAP_Y + 0.5;
-                ctx.moveTo(gx, y);
-                ctx.lineTo(gridR, y);
-            }
-        }
-        ctx.stroke();
-
-        // Day dividers
-        ctx.strokeStyle = '#252530';
-        ctx.beginPath();
-        for (let d = 0; d <= CONFIG.DAYS; d++) {
-            const x = gx + d * dw + 0.5;
-            ctx.moveTo(x, gy);
-            ctx.lineTo(x, gridB);
-        }
-        ctx.stroke();
-
-        // Entities — rect + text per entity so overlapping z-order is correct
-        const LINE_H = 14;
-        const TEXT_PAD = 6;
-        const TITLE_FONT = '600 11px -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif';
-        const BULLET_FONT = '10px -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif';
-        ctx.textBaseline = 'top';
-        ctx.textAlign = 'left';
-
-        for (let i = 0; i < this.count; i++) {
-            const ex = this.xs[i];
-            const ey = this.ys[i];
-            const ew = this.ws[i];
-            const eh = this.hs[i];
-            if (ey > lh || ey + eh < 0) continue;
-
-            const t = this.types[i];
-            ctx.fillStyle = TYPE_COLORS[t][0];
-            ctx.fillRect(ex, ey, ew, eh);
-            ctx.strokeStyle = TYPE_COLORS[t][1];
-            ctx.strokeRect(ex, ey, ew, eh);
-
-            if (eh < 20) continue;
-
-            // Clip text to entity bounds
-            ctx.save();
-            ctx.beginPath();
-            ctx.rect(ex, ey, ew, eh);
-            ctx.clip();
-
-            const lines = this.labels[i];
-            let ty = ey + 4;
-
-            ctx.font = TITLE_FONT;
-            ctx.fillStyle = '#ddd';
-            ctx.fillText(lines[0], ex + TEXT_PAD, ty);
-            ty += LINE_H;
-
-            if (ty + LINE_H <= ey + eh) {
-                ctx.font = BULLET_FONT;
-                ctx.fillStyle = '#888';
-
-                for (let l = 1; l < 5; l++) {
-                    if (ty + LINE_H > ey + eh) break;
-                    ctx.fillText('- ' + lines[l], ex + TEXT_PAD, ty);
-                    ty += LINE_H;
-                }
-            }
-
-            ctx.restore();
-        }
-
-        ctx.restore();
+        this.perfEl.textContent =
+            `FPS: ${realFps.toFixed(0)} | frame: ${avgFrame.toFixed(2)}ms\n` +
+            `SDF:    ${avgSdf.toFixed(2)}ms (${this.shapes.length} shapes)\n` +
+            `Clip:   ${avgClip.toFixed(2)}ms (${avgSegs + avgArcs} edges)\n` +
+            `SVG:    ${avgSvg.toFixed(2)}ms (${avgSegs}/${this.segmentPoolSize} lines, ${avgArcs}/${this.arcPoolSize} arcs)\n` +
+            `Total:  ${(avgSdf + avgClip + avgSvg).toFixed(2)}ms`;
     }
 
-    // ── Input ───────────────────────────────────────────────────────────
-
-    _bindInput() {
-        this.container.addEventListener('mousemove', (e) => {
-            const r = this.container.getBoundingClientRect();
-            this.mouseX = e.clientX - r.left;
-            this.mouseY = e.clientY - r.top;
-
-            if (this.dragIdx >= 0) {
-                this.dragInputTime = performance.now();
-                const di = this.dragIdx;
-                if (this.dragMode === 'resize-bottom') {
-                    this.hs[di] = Math.max(SNAP_Y, this.mouseY - this.ys[di]);
-                } else if (this.dragMode === 'resize-top') {
-                    // Move top edge, keep bottom edge fixed
-                    const bottom = this.dragAnchorBottom;
-                    const newY = Math.min(this.mouseY, bottom - SNAP_Y);
-                    this.ys[di] = newY;
-                    this.hs[di] = bottom - newY;
-                } else {
-                    this.xs[di] = this.mouseX - this.dragOffX;
-                    this.ys[di] = this.mouseY - this.dragOffY;
-                }
-                this.dirty = true;
-            }
-        });
-
-        this.container.addEventListener('dblclick', (e) => {
-            e.preventDefault();
-            if (!this.connected) return;
-            const r = this.container.getBoundingClientRect();
-            const mx = e.clientX - r.left;
-            const my = e.clientY - r.top;
-
-            // Must be inside the grid area
-            if (mx < CONFIG.LEFT_GUTTER || my < CONFIG.TOP_HEADER) return;
-
-            // Convert pixel position to day + startTime
-            const col = ((mx - CONFIG.LEFT_GUTTER) / CONFIG.DAY_WIDTH) | 0;
-            if (col >= CONFIG.DAYS) return;
-
-            const relMinutes = ((my - CONFIG.TOP_HEADER) / CONFIG.HOUR_HEIGHT + CONFIG.START_HOUR) * 60;
-            const startTime = Math.round(relMinutes / 15) * 15;
-
-            // Clamp: don't go past end of visible grid
-            if (startTime < CONFIG.START_HOUR * 60 || startTime + 30 > CONFIG.END_HOUR * 60) return;
-
-            this._sendCreateTask(this._weekStart() + col, startTime, 30);
-        });
-
-        // ── Global keyboard shortcuts ─────────────────────────────────
-        // All keybinds live here. None are conditional on view state —
-        // they work from wherever you are and take you where you want to go.
-        document.addEventListener('keydown', (e) => {
-            if (!e.altKey) return;
-            const key = e.key.toLowerCase();
-
-            if (key === 'm') {
-                // Alt-M: toggle monthly view
-                e.preventDefault();
-                this.viewMode = this.viewMode === 'month' ? 'week' : 'month';
-                if (this.viewMode === 'month') {
-                    for (let i = 0; i < this.pool.length; i++) this.pool[i].style.display = 'none';
-                } else {
-                    this.prevMX = -9999; // force flashlight refresh on return to week
-                }
-                this.dirty = true;
-            } else if (key === 'c') {
-                // Alt-C: Quake/Yakuake-style calendar collapse — slide from left
-                e.preventDefault();
-                this.container.classList.toggle('collapsed');
-            }
-        });
-
-        this.container.addEventListener('mousedown', (e) => {
-            const t = e.target;
-            if (!t.classList || !t.classList.contains('proxy')) return;
-            const idx = parseInt(t.dataset.idx);
-            if (isNaN(idx) || idx < 0 || idx >= this.count) return;
-
-            // Detect resize: click within 8px of top or bottom edge
-            const topEdge = this.ys[idx];
-            const bottomEdge = topEdge + this.hs[idx];
-            const nearBottom = Math.abs(this.mouseY - bottomEdge) < 8;
-            const nearTop = Math.abs(this.mouseY - topEdge) < 8;
-
-            this.dragIdx = idx;
-            if (e.altKey) {
-                // Alt+drag: clone mode — drag a ghost, original stays put
-                this.dragMode = 'clone';
-                this.cloneOriginX = this.xs[idx];
-                this.cloneOriginY = this.ys[idx];
-                this.dragOffX = this.mouseX - this.xs[idx];
-                this.dragOffY = this.mouseY - this.ys[idx];
-                t.style.cursor = 'copy';
-            } else if (nearBottom) {
-                this.dragMode = 'resize-bottom';
-                t.style.cursor = 'ns-resize';
-            } else if (nearTop) {
-                this.dragMode = 'resize-top';
-                this.dragAnchorBottom = bottomEdge; // fixed edge
-                t.style.cursor = 'ns-resize';
-            } else {
-                this.dragMode = 'move';
-                this.dragOffX = this.mouseX - this.xs[idx];
-                this.dragOffY = this.mouseY - this.ys[idx];
-                t.style.cursor = 'grabbing';
-            }
-            e.preventDefault();
-        });
-
-        window.addEventListener('mouseup', () => {
-            if (this.dragIdx < 0) return;
-            const i = this.dragIdx;
-
-            if (this.dragMode === 'clone') {
-                // Snap drop position to grid
-                const relY = this.ys[i] - CONFIG.TOP_HEADER;
-                const snappedY = Math.round(relY / SNAP_Y) * SNAP_Y + CONFIG.TOP_HEADER;
-                const col = Math.round((this.xs[i] - CONFIG.LEFT_GUTTER - 10) / CONFIG.DAY_WIDTH);
-                const day = Math.max(0, Math.min(col, CONFIG.DAYS - 1));
-                const startTime = Math.round(((snappedY - CONFIG.TOP_HEADER) / CONFIG.HOUR_HEIGHT + CONFIG.START_HOUR) * 60 / 15) * 15;
-                const duration  = Math.max(15, Math.round((this.hs[i] / CONFIG.HOUR_HEIGHT) * 60 / 15) * 15);
-
-                // Send clone as a new task with the original's metadata
-                if (this.connected) {
-                    const title     = this.labels[i][0];
-                    const priority  = this.priorities[i];
-                    const serviceId = this.serviceIds.subarray(i * 16, i * 16 + 16);
-                    const date      = this._weekStart() + day;
-                    this._sendCreateTask(date, startTime, duration, title, priority, serviceId);
-                }
-
-                // Restore original to where it was — server will add the clone separately
-                this.xs[i] = this.cloneOriginX;
-                this.ys[i] = this.cloneOriginY;
-
-            } else if (this.dragMode === 'resize-bottom') {
-                // Snap height to 15-min grid, minimum 15 minutes
-                this.hs[i] = Math.max(SNAP_Y, Math.round(this.hs[i] / SNAP_Y) * SNAP_Y);
-                if (this.connected) this._sendMoveTask(i);
-            } else if (this.dragMode === 'resize-top') {
-                // Snap top edge to grid, recalculate height from fixed bottom
-                const relY = this.ys[i] - CONFIG.TOP_HEADER;
-                this.ys[i] = Math.round(relY / SNAP_Y) * SNAP_Y + CONFIG.TOP_HEADER;
-                this.hs[i] = Math.max(SNAP_Y, this.dragAnchorBottom - this.ys[i]);
-                if (this.connected) this._sendMoveTask(i);
-            } else {
-                // Move: snap Y to 15-min grid, X to day column
-                const relY = this.ys[i] - CONFIG.TOP_HEADER;
-                this.ys[i] = Math.round(relY / SNAP_Y) * SNAP_Y + CONFIG.TOP_HEADER;
-                const col = Math.round((this.xs[i] - CONFIG.LEFT_GUTTER - 10) / CONFIG.DAY_WIDTH);
-                const clamped = Math.max(0, Math.min(col, CONFIG.DAYS - 1));
-                this.xs[i] = CONFIG.LEFT_GUTTER + clamped * CONFIG.DAY_WIDTH + 10;
-                if (this.connected) this._sendMoveTask(i);
-            }
-
-            this._rebuildIndex();
-            this.dirty = true;
-            this.dragIdx = -1;
-            this.dragMode = 'move';
-            this.dragInputTime = 0;
-            for (let p = 0; p < this.pool.length; p++) this.pool[p].style.cursor = 'grab';
-        });
+    _fpsFromRaf(now) {
+        if (!this._fpsSamples) this._fpsSamples = [];
+        this._fpsSamples.push(now);
+        // Keep last 61 samples (60 intervals)
+        while (this._fpsSamples.length > 61) this._fpsSamples.shift();
+        if (this._fpsSamples.length < 2) return 60;
+        const elapsed = this._fpsSamples[this._fpsSamples.length - 1] - this._fpsSamples[0];
+        return (this._fpsSamples.length - 1) / (elapsed / 1000);
     }
 
-    // ── Resize ──────────────────────────────────────────────────────────
-
-    _resize() {
-        const r = this.container.getBoundingClientRect();
-        this.canvas.width = r.width * this.dpr;
-        this.canvas.height = r.height * this.dpr;
-        this.canvas.style.width = r.width + 'px';
-        this.canvas.style.height = r.height + 'px';
-        this.dirty = true;
-    }
-
-    // ── Stats ───────────────────────────────────────────────────────────
-
-    _buildStatsPanel() {
-        const el = document.createElement('div');
-        el.className = 'perf-stats';
-        this.container.appendChild(el);
-
-        this._spans = {};
-        for (const k of ['fps', 'frame', 'entities', 'candidates', 'drag']) {
-            const s = document.createElement('div');
-            el.appendChild(s);
-            this._spans[k] = s;
+    destroy() {
+        this.running = false;
+        if (this._raf) cancelAnimationFrame(this._raf);
+        this.overlay.destroy();
+        if (this.flashSvg.parentNode) {
+            this.flashSvg.parentNode.removeChild(this.flashSvg);
         }
-    }
-
-    _showStats() {
-        let sum = 0;
-        for (let i = 0; i < this.ftCount; i++) sum += this.frameTimes[i];
-        const avg = this.ftCount > 0 ? sum / this.ftCount : 16.67;
-
-        this.stats.fps = Math.round(1000 / avg);
-        this.stats.frameTime = Math.round(avg * 10) / 10;
-
-        const s = this._spans;
-        s.fps.textContent        = 'FPS: ' + this.stats.fps;
-        s.frame.textContent      = 'Frame: ' + this.stats.frameTime + 'ms';
-        s.entities.textContent   = 'Entities: ' + this.count;
-        s.candidates.textContent = 'Near cursor: ' + this.stats.candidates;
-        s.drag.textContent = this.dragIdx >= 0
-            ? 'Drag: ' + this.stats.dragLatency.toFixed(1) + 'ms'
-            : 'Drag: idle';
-    }
-
-    // ── Data generation ─────────────────────────────────────────────────
-
-    _generate(count) {
-        const gx = CONFIG.LEFT_GUTTER;
-        const gy = CONFIG.TOP_HEADER;
-        const dw = CONFIG.DAY_WIDTH;
-        const hh = CONFIG.HOUR_HEIGHT;
-        const pad = 10;
-
-        for (let i = 0; i < count; i++) {
-            const col = (Math.random() * CONFIG.DAYS) | 0;
-            const hour = Math.random() * (HOURS - 1);
-            const dur = 0.25 + Math.random() * 2.75; // 15min — 3h
-
-            this.ids[i]   = i;
-            this.xs[i]    = gx + col * dw + pad;
-            this.ys[i]    = gy + hour * hh;
-            this.ws[i]    = dw - pad * 2;
-            this.hs[i]    = dur * hh;
-            this.types[i] = (Math.random() * 3) | 0;
-
-            const verb = LABEL_VERBS[(Math.random() * LABEL_VERBS.length) | 0];
-            const noun = LABEL_NOUNS[(Math.random() * LABEL_NOUNS.length) | 0];
-            const reason = LABEL_REASONS[(Math.random() * LABEL_REASONS.length) | 0];
-            this.labels[i] = [
-                verb + ' ' + noun + ': ' + reason,
-                LABEL_BULLETS[(Math.random() * LABEL_BULLETS.length) | 0],
-                LABEL_BULLETS[(Math.random() * LABEL_BULLETS.length) | 0],
-                LABEL_BULLETS[(Math.random() * LABEL_BULLETS.length) | 0],
-                LABEL_BULLETS[(Math.random() * LABEL_BULLETS.length) | 0],
-            ];
-        }
-
-        this.count = count;
-        this._rebuildIndex();
-        this.dirty = true;
-
-        // Force flashlight refresh on next frame
-        this.prevMX = -9999;
-        // Hide stale proxies
-        for (let i = 0; i < this.pool.length; i++) this.pool[i].style.display = 'none';
     }
 }
