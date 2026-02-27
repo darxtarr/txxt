@@ -296,17 +296,50 @@ class SidecarClient {
             this._log('click', `CREATE_AT (${x}, ${y})`);
         });
 
-        // 20Hz cursor send
-        this._cursorTimer = setInterval(() => this._sendCursor(), 50);
-
         // 1Hz msg/s counter
         this._rateTimer = setInterval(() => {
             this._msgRate = this._msgCount;
             this._msgCount = 0;
         }, 1000);
 
-        // rAF loop — FPS tracking + perf display
+        // rAF loop — cursor send + FPS tracking + perf display.
+        // Cursor send is deliberately inside rAF: naturally synchronized with
+        // the display refresh rate (32Hz on CloudPC). No fixed-Hz timer.
         this._rafHandle = requestAnimationFrame(t => this._rafLoop(t));
+
+        // Viewport resize — ResizeObserver on the container fires on any size
+        // change (window resize, panel collapse, etc.), not just window.resize.
+        this._resizeObserver = new ResizeObserver(() => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                this._sendViewportSize();
+            }
+        });
+        this._resizeObserver.observe(this.container);
+
+        // Visibility / focus loss — clear overlay immediately when page is
+        // hidden so stale lines don't linger when the user alt-tabs back.
+        this._onVisibilityChange = () => {
+            if (document.hidden) {
+                this.overlay.update([]);
+                this.flashCircle.setAttribute('r', '0');
+                this._send0x22(false);
+            } else {
+                // Returning: re-send viewport (may have changed while hidden),
+                // dirty cursor so rAF sends a fresh position on next frame.
+                this._send0x22(true);
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this._sendViewportSize();
+                }
+                this._cursorDirty = true;
+            }
+        };
+        document.addEventListener('visibilitychange', this._onVisibilityChange);
+
+        // blur/focus covers focus loss without a full tab switch
+        this._onBlur  = () => { this.overlay.update([]); this.flashCircle.setAttribute('r', '0'); };
+        this._onFocus = () => { this._cursorDirty = true; };
+        window.addEventListener('blur',  this._onBlur);
+        window.addEventListener('focus', this._onFocus);
 
         this._log('sys', 'starting — connecting to ' + this.wsUrl);
         this._connect();
@@ -355,17 +388,13 @@ class SidecarClient {
         this._log('ws', `sent ViewportSize ${w}×${h}`);
     }
 
-    _sendCursor() {
-        if (!this._cursorDirty) return;
+    _send0x22(visible) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        this._cursorDirty = false;
-        this._lastCursorSendTime = performance.now();
-
-        const buf = new ArrayBuffer(5);
+        const buf = new ArrayBuffer(10);
         const dv = new DataView(buf);
-        dv.setUint8(0, 0x23);
-        dv.setUint16(1, this.cursorX, true);
-        dv.setUint16(3, this.cursorY, true);
+        dv.setUint8(0, 0x22);
+        dv.setUint8(1, visible ? 1 : 0);
+        dv.setBigUint64(2, 0n, true); // last_seen_rev — 0 for now
         this.ws.send(buf);
     }
 
@@ -474,10 +503,23 @@ class SidecarClient {
         }
     }
 
-    // ── rAF loop — FPS + perf display ────────────────────────
+    // ── rAF loop — cursor send + FPS + perf display ──────────
 
     _rafLoop(now) {
         this._rafHandle = requestAnimationFrame(t => this._rafLoop(t));
+
+        // Cursor send: once per frame, only when dirty and connected.
+        // Synchronized with display refresh (32Hz on CloudPC, 60Hz local).
+        if (this._cursorDirty && this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this._cursorDirty = false;
+            this._lastCursorSendTime = performance.now();
+            const buf = new ArrayBuffer(5);
+            const dv = new DataView(buf);
+            dv.setUint8(0, 0x23);
+            dv.setUint16(1, this.cursorX, true);
+            dv.setUint16(3, this.cursorY, true);
+            this.ws.send(buf);
+        }
 
         this._fpsSamples.push(now);
         while (this._fpsSamples.length > 61) this._fpsSamples.shift();
@@ -534,12 +576,30 @@ class SidecarClient {
         this.flashSvg.style.display = show ? '' : 'none';
     }
 
+    // ── Log download ──────────────────────────────────────────
+
+    saveLog() {
+        const el = this._logEl;
+        if (!el) return;
+        const lines = Array.from(el.children).map(d => d.textContent).join('\n');
+        const blob = new Blob([lines], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `txxt-log-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
     // ── Cleanup ───────────────────────────────────────────────
 
     destroy() {
         cancelAnimationFrame(this._rafHandle);
-        clearInterval(this._cursorTimer);
         clearInterval(this._rateTimer);
+        this._resizeObserver.disconnect();
+        document.removeEventListener('visibilitychange', this._onVisibilityChange);
+        window.removeEventListener('blur',  this._onBlur);
+        window.removeEventListener('focus', this._onFocus);
         if (this.ws) this.ws.close();
         this.overlay.destroy();
         if (this._bgUrl) URL.revokeObjectURL(this._bgUrl);

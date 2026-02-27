@@ -19,6 +19,8 @@
             <input type="checkbox" id="show-circle" checked>
             Show circle
         </label>
+
+        <button id="save-log">Save log</button>
     </header>
 
     <main id="engine-container">
@@ -42,6 +44,10 @@
 
         showCircle.addEventListener('change', () => {
             client.setShowCircle(showCircle.checked);
+        });
+
+        document.getElementById('save-log').addEventListener('click', () => {
+            client.saveLog();
         });
     </script>
 </body>

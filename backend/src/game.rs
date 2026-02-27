@@ -43,6 +43,10 @@ struct ConnContext {
     viewport: (u16, u16),
     view_mode: ViewMode,
     user_id: Uuid,
+    /// True if the last OverlayCommands sent to this client was non-empty.
+    /// Used to gate sends: only transmit when overlay state changes.
+    /// Empty→empty: send nothing (codec sleeps). Non-empty→empty: send clear.
+    was_drawing: bool,
 }
 
 impl ConnContext {
@@ -52,6 +56,7 @@ impl ConnContext {
             viewport: (1316, 632),
             view_mode: ViewMode::Week,
             user_id,
+            was_drawing: false,
         }
     }
 }
@@ -161,21 +166,28 @@ async fn handle_message(
 
     match msg {
         ClientMsg::CursorMove { x, y } => {
-            let mut ctx = ctx.lock().await;
-            ctx.cursor = (x as f32, y as f32);
-            let cursor = ctx.cursor;
-            drop(ctx);
+            let (cursor, was_drawing) = {
+                let mut c = ctx.lock().await;
+                c.cursor = (x as f32, y as f32);
+                (c.cursor, c.was_drawing)
+            };
 
             // Spatial pass: read-lock only, no contention with mutations
             let shapes = state.shapes.read().await;
             let commands = state.overlay_gen.generate(cursor, 120.0, &shapes);
 
-            if !commands.is_empty() {
+            // Only send when overlay state changes — codec sleeps otherwise.
+            //   empty  + was_drawing  → send empty (clear the lines)
+            //   filled + any          → send commands (draw/update)
+            //   empty  + !was_drawing → send nothing (already clear)
+            let now_drawing = !commands.is_empty();
+            if now_drawing || was_drawing {
                 let overlay_bytes = wire::pack_overlay_commands(&commands, 0x00FF00FF);
                 let _ = state.game_tx.send(overlay_bytes);
+                ctx.lock().await.was_drawing = now_drawing;
             }
 
-            // Also send candidate list
+            // Candidate list: only send when non-empty
             let world = state.world.read().await;
             let candidates = spatial::build_candidate_list(
                 cursor, 120.0, &shapes,
