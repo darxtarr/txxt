@@ -204,11 +204,12 @@ function arcToPath(cx, cy, r, startAngle, sweepAngle) {
 //   Browser → Sidecar:
 //     0x20 ViewportSize: [type:u8][w:u16][h:u16]
 //     0x23 CursorMove:   [type:u8][x:u16][y:u16]
+//     0x27 CreateAt:     [type:u8][x:u16][y:u16]
 //
 //   Overlay command encoding:
-//     Segment: [cmd:u8=2][x1:u16][y1:u16][x2:u16][y2:u16][color:u32]          13 bytes
+//     Segment: [cmd:u8=2][x1:u16][y1:u16][x2:u16][y2:u16][color:u32]             13 bytes
 //     Arc:     [cmd:u8=1][cx:f32][cy:f32][r:f32][start:f32][sweep:f32][color:u32] 25 bytes
-//     Clear:   [cmd:u8=0][0×12 padding]                                         13 bytes
+//     Clear:   [cmd:u8=0][0×12 padding]                                            13 bytes
 // ============================================================================
 
 class SidecarClient {
@@ -221,13 +222,24 @@ class SidecarClient {
         this.wsUrl = wsUrl || 'ws://localhost:3000/ws';
         this.ws = null;
         this._bgUrl = null;
+        this._connected = false;
 
         this.cursorX = 0;
         this.cursorY = 0;
         this._cursorDirty = false;
         this.flashlightRadius = 120; // visual only — sidecar owns the actual radius
-
         this.showCircle = true;
+
+        // Perf state
+        this._fpsSamples   = [];
+        this._svgMs        = 0;
+        this._latencyMs    = 0;
+        this._activeSegs   = 0;
+        this._activeArcs   = 0;
+        this._msgCount     = 0;   // messages received this second
+        this._msgRate      = 0;   // messages/s (updated every second)
+        this._lastCursorSendTime  = 0;
+        this._lastOverlayLogTime  = 0;
 
         // Overlay (production module, identical to testbed)
         this.overlay = new Overlay(this.container, {
@@ -237,7 +249,7 @@ class SidecarClient {
             strokeWidth: 2,
         });
 
-        // Flashlight circle indicator (visual feedback — matches sidecar radius)
+        // Flashlight circle indicator
         const ns = 'http://www.w3.org/2000/svg';
         this.flashSvg = document.createElementNS(ns, 'svg');
         this.flashSvg.setAttribute('class', 'flashlight-svg');
@@ -250,9 +262,9 @@ class SidecarClient {
         this.flashCircle.setAttribute('stroke-opacity', '0.6');
         this.flashSvg.appendChild(this.flashCircle);
 
-        // Perf display
+        // UI elements
         this.perfEl = document.getElementById('perf');
-        this._setStatus('Connecting…');
+        this._logEl = document.getElementById('log');
 
         // Mouse tracking
         this.container.addEventListener('mousemove', (e) => {
@@ -269,9 +281,7 @@ class SidecarClient {
             this._cursorDirty = true;
         });
 
-        // Click → CREATE_AT (0x27): creates a task at the clicked grid position.
-        // The sidecar snaps to 15-min grid, creates the task, re-renders, and
-        // broadcasts the new background image. Move cursor over the box to trace it.
+        // Click → CREATE_AT (0x27)
         this.container.addEventListener('click', (e) => {
             if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
             const rect = this.container.getBoundingClientRect();
@@ -279,15 +289,26 @@ class SidecarClient {
             const y = Math.round(e.clientY - rect.top);
             const buf = new ArrayBuffer(5);
             const dv = new DataView(buf);
-            dv.setUint8(0, 0x27); // CREATE_AT
+            dv.setUint8(0, 0x27);
             dv.setUint16(1, x, true);
             dv.setUint16(3, y, true);
             this.ws.send(buf);
+            this._log('click', `CREATE_AT (${x}, ${y})`);
         });
 
-        // 20Hz cursor send — only when dirty
+        // 20Hz cursor send
         this._cursorTimer = setInterval(() => this._sendCursor(), 50);
 
+        // 1Hz msg/s counter
+        this._rateTimer = setInterval(() => {
+            this._msgRate = this._msgCount;
+            this._msgCount = 0;
+        }, 1000);
+
+        // rAF loop — FPS tracking + perf display
+        this._rafHandle = requestAnimationFrame(t => this._rafLoop(t));
+
+        this._log('sys', 'starting — connecting to ' + this.wsUrl);
         this._connect();
     }
 
@@ -298,25 +319,29 @@ class SidecarClient {
         this.ws.binaryType = 'arraybuffer';
 
         this.ws.addEventListener('open', () => {
-            this._setStatus('Connected — awaiting frame…');
+            this._connected = true;
+            this._log('ws', 'connected');
             this._sendViewportSize();
         });
 
         this.ws.addEventListener('message', (e) => {
+            this._msgCount++;
             this._onMessage(e.data);
         });
 
         this.ws.addEventListener('close', () => {
-            this._setStatus('Disconnected — reconnecting in 2s…');
+            this._connected = false;
+            this._log('ws', 'disconnected — reconnecting in 2s');
+            if (this.perfEl) this.perfEl.textContent = 'Disconnected — reconnecting…';
             setTimeout(() => this._connect(), 2000);
         });
 
         this.ws.addEventListener('error', () => {
-            // close event fires after error, reconnect happens there
+            // close fires after error, reconnect happens there
         });
     }
 
-    // ── Outbound messages ─────────────────────────────────────
+    // ── Outbound ──────────────────────────────────────────────
 
     _sendViewportSize() {
         const w = this.container.clientWidth;
@@ -327,12 +352,14 @@ class SidecarClient {
         dv.setUint16(1, w, true);
         dv.setUint16(3, h, true);
         this.ws.send(buf);
+        this._log('ws', `sent ViewportSize ${w}×${h}`);
     }
 
     _sendCursor() {
         if (!this._cursorDirty) return;
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         this._cursorDirty = false;
+        this._lastCursorSendTime = performance.now();
 
         const buf = new ArrayBuffer(5);
         const dv = new DataView(buf);
@@ -342,12 +369,11 @@ class SidecarClient {
         this.ws.send(buf);
     }
 
-    // ── Inbound messages ──────────────────────────────────────
+    // ── Inbound ───────────────────────────────────────────────
 
     _onMessage(data) {
         const dv = new DataView(data);
         if (dv.byteLength < 1) return;
-
         const type = dv.getUint8(0);
 
         if (type === 0x10) {
@@ -360,12 +386,15 @@ class SidecarClient {
 
     _onBackgroundImage(dv, data) {
         // [type:u8][rev:u64][format:u8][w:u16][h:u16][...image bytes]
-        //  0        1        9           10     12     14
+        //  0        1        9          10     12     14
         if (dv.byteLength < 14) return;
 
         const rev = dv.getBigUint64(1, true);
         const format = dv.getUint8(9);
+        const w = dv.getUint16(10, true);
+        const h = dv.getUint16(12, true);
         const imageBytes = data.slice(14);
+        const kb = (imageBytes.byteLength / 1024).toFixed(1);
 
         const mimeType = format === 1 ? 'image/jpeg' : 'image/png';
         const blob = new Blob([imageBytes], { type: mimeType });
@@ -373,10 +402,9 @@ class SidecarClient {
 
         if (this._bgUrl) URL.revokeObjectURL(this._bgUrl);
         this._bgUrl = url;
-
         this.container.style.backgroundImage = `url(${url})`;
 
-        this._setStatus(`Connected | rev ${rev} | ${(imageBytes.byteLength / 1024).toFixed(1)} KB`);
+        this._log('bg', `rev=${rev}  ${w}×${h}  ${kb} KB  (${mimeType.split('/')[1]})`);
     }
 
     _onOverlayCommands(dv) {
@@ -385,6 +413,12 @@ class SidecarClient {
         //   Arc:     [1][cx:f32][cy:f32][r:f32][start:f32][sweep:f32][color:u32] 25 bytes
         //   Clear:   [0][0×12]                                                   13 bytes
         if (dv.byteLength < 2) return;
+
+        // Latency: time from last cursor send to this overlay response
+        const latency = this._lastCursorSendTime > 0
+            ? performance.now() - this._lastCursorSendTime
+            : 0;
+        this._latencyMs = latency;
 
         const count = dv.getUint8(1);
         const commands = [];
@@ -419,18 +453,79 @@ class SidecarClient {
                 });
                 offset += 25;
             } else {
-                break; // unknown command type — stop parsing
+                break;
             }
         }
 
+        const svgStart = performance.now();
         this.overlay.update(commands);
+        this._svgMs     = performance.now() - svgStart;
+        this._activeSegs = this.overlay.activeSegments;
+        this._activeArcs = this.overlay.activeArcs;
+
+        // Log overlay snapshot at most once per second (only when drawing something)
+        const now = performance.now();
+        if (now - this._lastOverlayLogTime > 1000 && (this._activeSegs + this._activeArcs) > 0) {
+            this._lastOverlayLogTime = now;
+            this._log('ov',
+                `${this._activeSegs}s ${this._activeArcs}a  ` +
+                `svg=${this._svgMs.toFixed(2)}ms  lat=~${latency.toFixed(0)}ms`
+            );
+        }
     }
 
-    // ── Controls (wired from index.html) ──────────────────────
+    // ── rAF loop — FPS + perf display ────────────────────────
+
+    _rafLoop(now) {
+        this._rafHandle = requestAnimationFrame(t => this._rafLoop(t));
+
+        this._fpsSamples.push(now);
+        while (this._fpsSamples.length > 61) this._fpsSamples.shift();
+
+        // Update display every 15 frames (~4× per second at 60fps)
+        if (this._fpsSamples.length % 15 === 0) this._updatePerfDisplay();
+    }
+
+    _updatePerfDisplay() {
+        if (!this.perfEl || !this._connected) return;
+
+        const fps = this._fpsSamples.length >= 2
+            ? (this._fpsSamples.length - 1) /
+              ((this._fpsSamples[this._fpsSamples.length - 1] - this._fpsSamples[0]) / 1000)
+            : 0;
+
+        this.perfEl.textContent =
+            `FPS: ${fps.toFixed(0)}  SVG: ${this._svgMs.toFixed(2)}ms  Lat: ~${this._latencyMs.toFixed(0)}ms\n` +
+            `Overlay: ${this._activeSegs}/256 segs  ${this._activeArcs}/64 arcs\n` +
+            `WS in: ${this._msgRate} msg/s`;
+    }
+
+    // ── Log ───────────────────────────────────────────────────
+
+    _log(tag, msg) {
+        const el = this._logEl;
+        if (!el) return;
+
+        const now = new Date();
+        const ts = now.toTimeString().slice(0, 8) + '.' +
+                   String(now.getMilliseconds()).padStart(3, '0');
+
+        const line = document.createElement('div');
+        line.textContent = `${ts}  ${tag.padEnd(5)}  ${msg}`;
+        el.appendChild(line);
+
+        // Keep last 200 entries
+        while (el.children.length > 200) el.removeChild(el.firstChild);
+
+        // Auto-scroll if already near bottom
+        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+        if (nearBottom) el.scrollTop = el.scrollHeight;
+    }
+
+    // ── Controls ──────────────────────────────────────────────
 
     setFlashlightRadius(r) {
         this.flashlightRadius = r;
-        // Update the visual circle immediately (sidecar radius stays at 120)
         this.flashCircle.setAttribute('r', r);
     }
 
@@ -442,16 +537,12 @@ class SidecarClient {
     // ── Cleanup ───────────────────────────────────────────────
 
     destroy() {
+        cancelAnimationFrame(this._rafHandle);
         clearInterval(this._cursorTimer);
+        clearInterval(this._rateTimer);
         if (this.ws) this.ws.close();
         this.overlay.destroy();
         if (this._bgUrl) URL.revokeObjectURL(this._bgUrl);
         if (this.flashSvg.parentNode) this.flashSvg.parentNode.removeChild(this.flashSvg);
-    }
-
-    // ── Internal ──────────────────────────────────────────────
-
-    _setStatus(msg) {
-        if (this.perfEl) this.perfEl.textContent = msg;
     }
 }

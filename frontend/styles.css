@@ -121,6 +121,31 @@ body {
     z-index: 20;
 }
 
+/* ── Event log ───────────────────────────────────────────────────────────── */
+
+#log {
+    position: absolute;
+    bottom: 8px;
+    left: 8px;
+    width: 480px;
+    max-height: 180px;
+    overflow-y: auto;
+    background: rgba(0, 0, 0, 0.80);
+    color: #556655;
+    padding: 6px 10px;
+    font-family: monospace;
+    font-size: 10px;
+    line-height: 1.65;
+    z-index: 100;
+    pointer-events: auto;
+    border: 1px solid #1a2a1a;
+    border-radius: 4px;
+}
+
+#log div {
+    white-space: pre;
+}
+
 /* ── Perf counters ───────────────────────────────────────────────────────── */
 
 #perf {
