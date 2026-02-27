@@ -6,87 +6,127 @@ Fast handoff for incoming sessions. Architecture rationale lives in `DESIGN.md`.
 
 ---
 
-## Phase: Sidecar Built — Frontend Integration Next
+## Phase: End-to-End Working — Overlay Refinement
 
-### Flashlight testbed (2026-02-26) — DONE
+### What is done
 
-Browser-only testbed in `frontend/` works locally. FPS rock solid. SVG arc bug
-fixed. Still waiting for CloudPC upgrade to run real VDI stress test, but the
-sidecar was built in parallel to unblock progress.
+**Flashlight testbed (2026-02-26)** — DONE. Browser-only stress test proved the
+SDF + clip geometry + SVG pool at up to 2000 shapes on real CloudPC VDI.
+Results: 32 FPS, 1.04ms frame time at 1260 shapes. Codec lag on fast cursor
+moves is expected and is VDI tax — not fixable, not a problem.
 
-### Rust sidecar (2026-02-27) — DONE
+**Rust sidecar (2026-02-27)** — DONE. 52 tests pass.
 
-Full modular sidecar built. 52 tests, all pass. `cargo build` and `cargo test`
-clean (warnings are expected dead code from Phase 1 stubs).
+**Frontend integration (2026-02-27)** — DONE. `frontend/txxt.js` connects to
+the sidecar via WebSocket. Background image displays. Click the grid to create
+tasks. Cursor movement traces task edges. Perf counters and event log visible.
+Tested locally and on CloudPC.
+
+---
+
+## What's being built now: Overlay correctness + client robustness
+
+Three issues identified during CloudPC testing, being fixed together:
+
+### 1. Overlay persistence bug (sidecar)
+
+**Problem:** `game.rs` only sends `OverlayCommands` when `!commands.is_empty()`.
+When the cursor moves away from shapes, the sidecar sends nothing, so the
+browser never clears the last frame's lines.
+
+**Fix:** `was_drawing: bool` per connection in `ConnContext`. State machine:
 
 ```
-backend/src/
-  main.rs       — boot, shared state, Axum router, serves frontend/
-  world.rs      — pure state machine (ported from archive, +artifact_count, -password_hash)
-  persist.rs    — redb save file (ported from archive, no auth/argon2)
-  wire.rs       — hop 1 binary protocol (0x10–0x2E), hop 2 stubs
-  renderer.rs   — tiny-skia with chrome cache, outputs image + Vec<RenderedShape>
-  spatial.rs    — SDF + clip geometry (ported from JS testbed), OverlayGenerator trait
-  game.rs       — Axum WS handler, per-connection context, subscribe-before-snapshot
+on CursorMove:
+    compute commands (SDF pass)
+
+    if commands.is_empty() && was_drawing:
+        send empty OverlayCommands   ← clear the lines (state changed)
+        was_drawing = false
+
+    elif !commands.is_empty():
+        send commands                ← draw/update (state changed)
+        was_drawing = true
+
+    else:                            ← empty, was already empty
+        send nothing                 ← codec sleeps, no wire traffic
 ```
 
-**What each module does:**
+This is the key design: the codec only wakes when the overlay set changes.
+Cursor gliding through empty space generates zero wire traffic.
 
-- **world.rs** — Command/Event state machine. Task has `artifact_count: u8`.
-  User has no `password_hash` (auth removed). All archive tests carried forward.
-- **persist.rs** — redb save file. `flush()` after every mutation. `load_world()`
-  on boot. Seeds default services + user. No argon2.
-- **wire.rs** — Hop 1: `BackgroundImage(0x10)`, `CandidateList(0x11)`,
-  `OverlayCommands(0x1A)`, `ClientMsg(0x20–0x2E)`. Hop 2: `pack_snapshot` and
-  `pack_event` as `#[allow(dead_code)]` stubs with task record stride (192 bytes).
-- **renderer.rs** — Chrome cache (grid + headers) rebuilt only on viewport/view
-  change. Task layer stamped on clone of chrome. Returns `RenderOutput`:
-  image bytes + `Vec<RenderedShape>` (pixel-space bounding boxes for spatial).
-- **spatial.rs** — `trait OverlayGenerator` (THE modularity seam). `SdfOverlay`
-  is the Phase 1 impl (O(n) brute force, direct port of JS testbed). Separate
-  `build_candidate_list()` function. SDF functions for Rect and RoundedRect.
-  Clip geometry: segment ∩ circle, arc ∩ circle.
-- **game.rs** — Axum WS handler. Subscribe-before-snapshot ordering (critical).
-  `CursorMove` → read-lock shapes → spatial pass → send overlay + candidates.
-  Mutation → write-lock world → flush → re-render → broadcast.
-- **main.rs** — Boot sequence. `AppState` with `Arc<dyn OverlayGenerator>`.
-  Router: `/ws` for game, fallback to `ServeDir` for frontend.
+### 2. Cursor send frequency (client)
 
-### What's next: Frontend integration (Step 7 from the plan)
+**Problem:** Cursor was sent on a `setInterval` at 20Hz (50ms). This is not
+synchronized with the display and can double-send or miss frames. On CloudPC
+the display is capped at 32Hz — a 20Hz timer is worse than the framerate.
 
-Wire the browser to the real sidecar. This is the last step before end-to-end
-testing on CloudPC.
+**Fix:** Cursor send moves into the rAF loop. One check per frame: if cursor
+moved since last frame, send. rAF naturally runs at the display refresh rate
+(32Hz on CloudPC, 60Hz locally). No separate timer.
 
-1. **Delete TestHarness class** from `ironclad.js` (it's throwaway code).
-2. **Add SidecarClient class** — WebSocket connection to `ws://localhost:3000/ws`,
-   binary message decode, 20Hz cursor position send.
-3. **Overlay class stays unchanged** — just gets fed from WS instead of harness.
-4. **Rename IRONCLAD → txxt** everywhere:
-   - `frontend/ironclad.js` → `frontend/txxt.js`
-   - HTML `<title>` and visible text
-   - CLAUDE.md, CURRENT_STATE.md, DESIGN.md references
-   - JS comments and CSS class names
+### 3. Visibility / focus loss (client)
 
-**Gate:** Same visual behavior as testbed, but driven by real sidecar. Browser
-connects, background image appears, cursor movement produces overlay traces.
+**Problem:** When a user alt-tabs away, cursor events stop. The overlay lines
+from the last position stay visible until the user returns and moves again.
 
-### After frontend integration
+**Fix:** Two layers:
+- `visibilitychange` → hidden: call `overlay.update([])` immediately (client-side
+  clear, no round-trip), hide flashlight circle, send `0x22 VisibilityChange`
+  to sidecar.
+- `visibilitychange` → visible: re-send viewport size (window may have been
+  resized while hidden), dirty the cursor to trigger a fresh send on next frame.
 
-- CloudPC stress test (VDI codec, resource-constrained hardware)
-- Materialization module (mousedown → div, candidate list)
+Window `blur`/`focus` handles the same for focus-loss without full tab switch.
+
+### 4. Viewport resize (client)
+
+**Problem:** `ViewportSize` (0x20) is only sent on connect. If the user resizes
+the window, the sidecar keeps rendering at the old size.
+
+**Fix:** `ResizeObserver` on the engine container. Fires on any size change,
+sends a fresh `0x20`. Sidecar calls `renderer.resize()`, re-renders, broadcasts.
+
+### 5. Log download (client)
+
+**Problem:** Taking a screenshot on CloudPC takes 3-4 seconds (Windows tooling
+is slow on VDI). Not useful for capturing momentary events.
+
+**Fix:** "Save log" button. Exports the full accumulated event log as a `.txt`
+file via browser download. Millisecond timestamps throughout. Shareable.
+
+---
+
+## After overlay refinement
+
+- CloudPC stress test with real sidecar (not testbed shapes)
+- Materialization module (mousedown → div, fed by candidate list)
 - Short-ID mapping (wire uses u16 task IDs, world uses UUIDs)
 - EC2 relay (hop 2 — do not wire prematurely)
 
 ---
 
-## Modularity seams — what can be swapped
+## Sidecar module map
+
+```
+backend/src/
+  main.rs       — boot, AppState, Axum router, serves frontend/
+  world.rs      — pure state machine (+artifact_count, -password_hash)
+  persist.rs    — redb save file, flush() on every mutation
+  wire.rs       — hop 1 binary protocol (0x10–0x2E), hop 2 stubs
+  renderer.rs   — tiny-skia, chrome cache, returns image + Vec<RenderedShape>
+  spatial.rs    — SDF + clip geometry, trait OverlayGenerator (THE seam)
+  game.rs       — Axum WS handler, subscribe-before-snapshot, was_drawing state
+```
+
+## Modularity seams
 
 | What | Mechanism | Where |
 |------|-----------|-------|
 | Overlay algorithm | `trait OverlayGenerator` | `Arc::new(SdfOverlay)` in main.rs |
-| Image format | `ImageFormat` enum (Png/Jpeg/Rgba) | `image_format` field in AppState |
-| Chrome cache | `ChromeCacheKey` invalidation | Change key fields in renderer.rs |
-| Hop 2 transport | `wire::pack_snapshot`/`pack_event` stubs | Wire in game.rs when EC2 ready |
+| Image format | `ImageFormat` enum (Png/Jpeg/Rgba) | `image_format` in AppState |
+| Chrome cache | `ChromeCacheKey` invalidation | renderer.rs |
+| Hop 2 transport | `wire::pack_snapshot`/`pack_event` stubs | game.rs when EC2 ready |
 
 Only ONE trait: `OverlayGenerator`. Everything else is data boundaries or config.
 
@@ -105,6 +145,30 @@ Only ONE trait: `OverlayGenerator`. Everything else is data boundaries or config
 ```
 
 The axiom: **everything is possible but nothing is real until the click.**
+
+---
+
+## Wire protocol summary (hop 1)
+
+All multi-byte values little-endian.
+
+| Byte | Direction | Message | Payload |
+|------|-----------|---------|---------|
+| 0x10 | S→B | BackgroundImage | rev:u64, format:u8, w:u16, h:u16, bytes |
+| 0x11 | S→B | CandidateList | count:u8, per-entry: id:u16 x/y/w/h:u16 color:u32 sdf:i16 title |
+| 0x1A | S→B | OverlayCommands | count:u8, per-cmd (see below) |
+| 0x20 | B→S | ViewportSize | w:u16, h:u16 |
+| 0x22 | B→S | VisibilityChange | visible:u8, last_rev:u64 |
+| 0x23 | B→S | CursorMove | x:u16, y:u16 |
+| 0x27 | B→S | CreateAt | x:u16, y:u16 |
+
+OverlayCommands per-command encoding:
+
+| cmd byte | Type | Payload | Total |
+|----------|------|---------|-------|
+| 0 | Clear | 12 bytes padding | 13 |
+| 1 | Arc | cx:f32 cy:f32 r:f32 start:f32 sweep:f32 color:u32 | 25 |
+| 2 | Segment | x1:u16 y1:u16 x2:u16 y2:u16 color:u32 | 13 |
 
 ---
 
@@ -138,10 +202,11 @@ TXXT_FRONTEND=../frontend          # Frontend path (default: ../frontend)
 | File | What |
 |------|------|
 | `DESIGN.md` | Architecture source of truth — read first |
-| `CURRENT_STATE.md` | This file — where we are and what to build next |
+| `CURRENT_STATE.md` | This file |
 | `CLAUDE.md` | Session instructions for AI partners |
 | `KEYBINDS.md` | Active and planned keybinds |
 | `flashlight-overlay.png` | Visual spec for flashlight overlay |
-| `frontend/` | Browser client — testbed, pending WS integration |
+| `frontend/txxt.js` | Browser client — Overlay class + SidecarClient |
+| `frontend/index.html` | Shell |
 | `backend/src/` | Sidecar — fully built, 52 tests pass |
 | `archive/` | Previous versions — reference only |
