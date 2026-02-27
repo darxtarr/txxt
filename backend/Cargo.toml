@@ -10,12 +10,14 @@ redb = "2"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-argon2 = "0.5"
-jsonwebtoken = "9"
 tower-http = { version = "0.5", features = ["fs", "cors"] }
-chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 tiny-skia = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+[features]
+default = []
+jpeg = ["image/jpeg"]
 
 [profile.release]
 lto = true

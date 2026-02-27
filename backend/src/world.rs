@@ -1,0 +1,689 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use uuid::Uuid;
+
+// ── Entity types ──────────────────────────────────────────────
+
+/// Task status lifecycle: Staged → Scheduled → Active → Completed
+///
+/// Staged    = exists but has no time slot (lives in the staging queue)
+/// Scheduled = has a slot on the timeline
+/// Active    = being worked right now
+/// Completed = done
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum TaskStatus {
+    Staged = 0,
+    Scheduled = 1,
+    Active = 2,
+    Completed = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Priority {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+    Urgent = 3,
+}
+
+/// A task — the unit of work on the scheduling grid.
+///
+/// `start` is minutes since Unix epoch (None = Staged).
+/// Derive everything from it:
+///   epoch_day    = start / 1440
+///   day_of_week  = (epoch_day + 3) % 7  →  0=Mon .. 6=Sun
+///   time_of_day  = start % 1440         →  minutes from midnight
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    pub id: Uuid,
+    pub title: String,
+    pub status: TaskStatus,
+    pub priority: Priority,
+    pub service_id: Uuid,
+    pub created_by: Uuid,
+    pub assigned_to: Option<Uuid>,
+    /// Minutes since Unix epoch. None if Staged.
+    pub start: Option<u32>,
+    /// Duration in minutes. None if Staged.
+    pub duration: Option<u16>,
+    /// Number of attached artifacts (files). Tracked for display, not stored inline.
+    pub artifact_count: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: Uuid,
+    pub username: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Service {
+    pub id: Uuid,
+    pub name: String,
+}
+
+// ── Commands (client → server) ────────────────────────────────
+
+/// A command is something a client wants to happen.
+/// The server validates it, applies it, and returns an Event (or an error).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Command {
+    CreateTask {
+        title: String,
+        service_id: Uuid,
+        priority: Priority,
+        assigned_to: Option<Uuid>,
+        /// If both scheduling fields are Some, create directly as Scheduled.
+        /// If None, create as Staged.
+        start: Option<u32>,
+        duration: Option<u16>,
+    },
+    ScheduleTask {
+        task_id: Uuid,
+        start: u32,
+        duration: u16,
+    },
+    MoveTask {
+        task_id: Uuid,
+        start: u32,
+        duration: u16,
+    },
+    UnscheduleTask {
+        task_id: Uuid,
+    },
+    CompleteTask {
+        task_id: Uuid,
+    },
+    DeleteTask {
+        task_id: Uuid,
+    },
+}
+
+// ── Events (server → clients) ─────────────────────────────────
+
+/// An event is what actually happened. Broadcast to all connected clients.
+/// Each event carries the revision number it was applied at.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Event {
+    TaskCreated {
+        revision: u64,
+        task: Task,
+    },
+    TaskScheduled {
+        revision: u64,
+        task_id: Uuid,
+        start: u32,
+        duration: u16,
+    },
+    TaskMoved {
+        revision: u64,
+        task_id: Uuid,
+        start: u32,
+        duration: u16,
+    },
+    TaskUnscheduled {
+        revision: u64,
+        task_id: Uuid,
+    },
+    TaskCompleted {
+        revision: u64,
+        task_id: Uuid,
+    },
+    TaskDeleted {
+        revision: u64,
+        task_id: Uuid,
+    },
+}
+
+// ── Errors ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldError {
+    TaskNotFound,
+    ServiceNotFound,
+    InvalidDuration,
+    InvalidTransition,
+}
+
+// ── The World ──────────────────────────────────────────────────
+
+/// The authoritative game state. Lives in memory. Loaded from redb on boot.
+/// All mutations go through apply() which validates, mutates, and returns
+/// an Event for broadcast.
+pub struct World {
+    pub tasks: HashMap<Uuid, Task>,
+    pub users: HashMap<Uuid, User>,
+    pub services: HashMap<Uuid, Service>,
+    pub revision: u64,
+    /// Recent event log for reconnect replay and undo.
+    pub log: Vec<(u64, Event)>,
+}
+
+impl World {
+    pub fn new() -> Self {
+        World {
+            tasks: HashMap::new(),
+            users: HashMap::new(),
+            services: HashMap::new(),
+            revision: 0,
+            log: Vec::new(),
+        }
+    }
+
+    /// Apply a command to the world. Returns the resulting Event on success.
+    /// This is THE mutation codepath — every state change goes through here.
+    pub fn apply(&mut self, cmd: Command, user_id: Uuid) -> Result<Event, WorldError> {
+        match cmd {
+            Command::CreateTask { title, service_id, priority, assigned_to, start, duration } => {
+                if !self.services.contains_key(&service_id) {
+                    return Err(WorldError::ServiceNotFound);
+                }
+
+                let (status, start, duration) = match (start, duration) {
+                    (Some(s), Some(dur)) => {
+                        validate_scheduling(dur)?;
+                        (TaskStatus::Scheduled, Some(s), Some(dur))
+                    }
+                    _ => (TaskStatus::Staged, None, None),
+                };
+
+                let task = Task {
+                    id: Uuid::new_v4(),
+                    title,
+                    status,
+                    priority,
+                    service_id,
+                    created_by: user_id,
+                    assigned_to,
+                    start,
+                    duration,
+                    artifact_count: 0,
+                };
+
+                self.revision += 1;
+                let event = Event::TaskCreated {
+                    revision: self.revision,
+                    task: task.clone(),
+                };
+                self.tasks.insert(task.id, task);
+                self.log.push((self.revision, event.clone()));
+                Ok(event)
+            }
+
+            Command::ScheduleTask { task_id, start, duration } => {
+                validate_scheduling(duration)?;
+
+                let task = self.tasks.get_mut(&task_id)
+                    .ok_or(WorldError::TaskNotFound)?;
+
+                if task.status != TaskStatus::Staged {
+                    return Err(WorldError::InvalidTransition);
+                }
+
+                task.status = TaskStatus::Scheduled;
+                task.start = Some(start);
+                task.duration = Some(duration);
+
+                self.revision += 1;
+                let event = Event::TaskScheduled {
+                    revision: self.revision,
+                    task_id,
+                    start,
+                    duration,
+                };
+                self.log.push((self.revision, event.clone()));
+                Ok(event)
+            }
+
+            Command::MoveTask { task_id, start, duration } => {
+                validate_scheduling(duration)?;
+
+                let task = self.tasks.get_mut(&task_id)
+                    .ok_or(WorldError::TaskNotFound)?;
+
+                if task.status != TaskStatus::Scheduled && task.status != TaskStatus::Active {
+                    return Err(WorldError::InvalidTransition);
+                }
+
+                task.start = Some(start);
+                task.duration = Some(duration);
+
+                self.revision += 1;
+                let event = Event::TaskMoved {
+                    revision: self.revision,
+                    task_id,
+                    start,
+                    duration,
+                };
+                self.log.push((self.revision, event.clone()));
+                Ok(event)
+            }
+
+            Command::UnscheduleTask { task_id } => {
+                let task = self.tasks.get_mut(&task_id)
+                    .ok_or(WorldError::TaskNotFound)?;
+
+                if task.status != TaskStatus::Scheduled && task.status != TaskStatus::Active {
+                    return Err(WorldError::InvalidTransition);
+                }
+
+                task.status = TaskStatus::Staged;
+                task.start = None;
+                task.duration = None;
+
+                self.revision += 1;
+                let event = Event::TaskUnscheduled {
+                    revision: self.revision,
+                    task_id,
+                };
+                self.log.push((self.revision, event.clone()));
+                Ok(event)
+            }
+
+            Command::CompleteTask { task_id } => {
+                let task = self.tasks.get_mut(&task_id)
+                    .ok_or(WorldError::TaskNotFound)?;
+
+                if task.status != TaskStatus::Scheduled && task.status != TaskStatus::Active {
+                    return Err(WorldError::InvalidTransition);
+                }
+
+                task.status = TaskStatus::Completed;
+
+                self.revision += 1;
+                let event = Event::TaskCompleted {
+                    revision: self.revision,
+                    task_id,
+                };
+                self.log.push((self.revision, event.clone()));
+                Ok(event)
+            }
+
+            Command::DeleteTask { task_id } => {
+                if self.tasks.remove(&task_id).is_none() {
+                    return Err(WorldError::TaskNotFound);
+                }
+
+                self.revision += 1;
+                let event = Event::TaskDeleted {
+                    revision: self.revision,
+                    task_id,
+                };
+                self.log.push((self.revision, event.clone()));
+                Ok(event)
+            }
+        }
+    }
+
+    /// Get all Staged tasks, sorted by priority (highest first).
+    pub fn staging_queue(&self) -> Vec<&Task> {
+        let mut staged: Vec<&Task> = self.tasks.values()
+            .filter(|t| t.status == TaskStatus::Staged)
+            .collect();
+        staged.sort_by(|a, b| b.priority.cmp(&a.priority));
+        staged
+    }
+
+    /// Get all events since a given revision (for reconnect replay).
+    /// Returns None if the revision is too old (caller should send full snapshot).
+    pub fn events_since(&self, since_rev: u64) -> Option<&[(u64, Event)]> {
+        let start = self.log.iter().position(|(rev, _)| *rev > since_rev);
+        match start {
+            Some(idx) => Some(&self.log[idx..]),
+            None if since_rev >= self.revision => Some(&[]),
+            None => None,
+        }
+    }
+}
+
+// ── Validation helpers ─────────────────────────────────────────
+
+fn validate_scheduling(duration: u16) -> Result<(), WorldError> {
+    if duration == 0 {
+        return Err(WorldError::InvalidDuration);
+    }
+    Ok(())
+}
+
+// ── Tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 2026-02-11 (Wednesday) = epoch day 20495 = minute 29_512_800
+    // 2026-02-12 (Thursday)  = epoch day 20496 = minute 29_514_240
+    const D:  u32 = 29_512_800;
+    const D2: u32 = 29_514_240;
+
+    fn test_world() -> World {
+        let mut w = World::new();
+        w.services.insert(
+            Uuid::nil(),
+            Service { id: Uuid::nil(), name: "Test Service".into() },
+        );
+        w
+    }
+
+    fn create_task(w: &mut World) -> Uuid {
+        let event = w.apply(
+            Command::CreateTask {
+                title: "Fix the thing".into(),
+                service_id: Uuid::nil(),
+                priority: Priority::Medium,
+                assigned_to: None,
+                start: None,
+                duration: None,
+            },
+            Uuid::nil(),
+        ).unwrap();
+
+        match event {
+            Event::TaskCreated { task, .. } => task.id,
+            _ => panic!("expected TaskCreated"),
+        }
+    }
+
+    #[test]
+    fn create_task_starts_staged() {
+        let mut w = test_world();
+        let id = create_task(&mut w);
+
+        let task = &w.tasks[&id];
+        assert_eq!(task.status, TaskStatus::Staged);
+        assert_eq!(task.start, None);
+        assert_eq!(task.duration, None);
+        assert_eq!(task.artifact_count, 0);
+        assert_eq!(w.revision, 1);
+    }
+
+    #[test]
+    fn create_task_with_scheduling() {
+        let mut w = test_world();
+        let event = w.apply(
+            Command::CreateTask {
+                title: "New task".into(),
+                service_id: Uuid::nil(),
+                priority: Priority::Medium,
+                assigned_to: None,
+                start: Some(D + 540),
+                duration: Some(30),
+            },
+            Uuid::nil(),
+        ).unwrap();
+
+        let id = match event {
+            Event::TaskCreated { task, .. } => task.id,
+            _ => panic!("expected TaskCreated"),
+        };
+
+        let task = &w.tasks[&id];
+        assert_eq!(task.status, TaskStatus::Scheduled);
+        assert_eq!(task.start, Some(D + 540));
+        assert_eq!(task.duration, Some(30));
+    }
+
+    #[test]
+    fn create_task_requires_valid_service() {
+        let mut w = World::new();
+        let result = w.apply(
+            Command::CreateTask {
+                title: "Orphan".into(),
+                service_id: Uuid::new_v4(),
+                priority: Priority::Low,
+                assigned_to: None,
+                start: None,
+                duration: None,
+            },
+            Uuid::nil(),
+        );
+        assert_eq!(result.unwrap_err(), WorldError::ServiceNotFound);
+        assert_eq!(w.revision, 0);
+    }
+
+    #[test]
+    fn schedule_staged_task() {
+        let mut w = test_world();
+        let id = create_task(&mut w);
+
+        w.apply(
+            Command::ScheduleTask { task_id: id, start: D + 540, duration: 60 },
+            Uuid::nil(),
+        ).unwrap();
+
+        let task = &w.tasks[&id];
+        assert_eq!(task.status, TaskStatus::Scheduled);
+        assert_eq!(task.start, Some(D + 540));
+        assert_eq!(task.duration, Some(60));
+        assert_eq!(w.revision, 2);
+    }
+
+    #[test]
+    fn cannot_schedule_already_scheduled() {
+        let mut w = test_world();
+        let id = create_task(&mut w);
+
+        w.apply(
+            Command::ScheduleTask { task_id: id, start: D + 480, duration: 30 },
+            Uuid::nil(),
+        ).unwrap();
+
+        let result = w.apply(
+            Command::ScheduleTask { task_id: id, start: D2 + 600, duration: 30 },
+            Uuid::nil(),
+        );
+        assert_eq!(result.unwrap_err(), WorldError::InvalidTransition);
+    }
+
+    #[test]
+    fn move_scheduled_task() {
+        let mut w = test_world();
+        let id = create_task(&mut w);
+
+        w.apply(
+            Command::ScheduleTask { task_id: id, start: D + 480, duration: 60 },
+            Uuid::nil(),
+        ).unwrap();
+
+        w.apply(
+            Command::MoveTask { task_id: id, start: D2 + 840, duration: 90 },
+            Uuid::nil(),
+        ).unwrap();
+
+        let task = &w.tasks[&id];
+        assert_eq!(task.start, Some(D2 + 840));
+        assert_eq!(task.duration, Some(90));
+        assert_eq!(w.revision, 3);
+    }
+
+    #[test]
+    fn cannot_move_staged_task() {
+        let mut w = test_world();
+        let id = create_task(&mut w);
+
+        let result = w.apply(
+            Command::MoveTask { task_id: id, start: D + 480, duration: 60 },
+            Uuid::nil(),
+        );
+        assert_eq!(result.unwrap_err(), WorldError::InvalidTransition);
+    }
+
+    #[test]
+    fn unschedule_puts_task_back_in_staging() {
+        let mut w = test_world();
+        let id = create_task(&mut w);
+
+        w.apply(
+            Command::ScheduleTask { task_id: id, start: D + 600, duration: 30 },
+            Uuid::nil(),
+        ).unwrap();
+
+        w.apply(Command::UnscheduleTask { task_id: id }, Uuid::nil()).unwrap();
+
+        let task = &w.tasks[&id];
+        assert_eq!(task.status, TaskStatus::Staged);
+        assert_eq!(task.start, None);
+        assert_eq!(task.duration, None);
+    }
+
+    #[test]
+    fn complete_scheduled_task() {
+        let mut w = test_world();
+        let id = create_task(&mut w);
+
+        w.apply(
+            Command::ScheduleTask { task_id: id, start: D + 480, duration: 60 },
+            Uuid::nil(),
+        ).unwrap();
+
+        w.apply(Command::CompleteTask { task_id: id }, Uuid::nil()).unwrap();
+
+        assert_eq!(w.tasks[&id].status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn cannot_complete_staged_task() {
+        let mut w = test_world();
+        let id = create_task(&mut w);
+
+        let result = w.apply(Command::CompleteTask { task_id: id }, Uuid::nil());
+        assert_eq!(result.unwrap_err(), WorldError::InvalidTransition);
+    }
+
+    #[test]
+    fn delete_task() {
+        let mut w = test_world();
+        let id = create_task(&mut w);
+
+        w.apply(Command::DeleteTask { task_id: id }, Uuid::nil()).unwrap();
+
+        assert!(!w.tasks.contains_key(&id));
+    }
+
+    #[test]
+    fn delete_nonexistent_task() {
+        let mut w = test_world();
+        let result = w.apply(
+            Command::DeleteTask { task_id: Uuid::new_v4() },
+            Uuid::nil(),
+        );
+        assert_eq!(result.unwrap_err(), WorldError::TaskNotFound);
+    }
+
+    #[test]
+    fn staging_queue_sorted_by_priority() {
+        let mut w = test_world();
+        let user = Uuid::nil();
+
+        w.apply(Command::CreateTask {
+            title: "Low".into(), service_id: Uuid::nil(),
+            priority: Priority::Low, assigned_to: None,
+            start: None, duration: None,
+        }, user).unwrap();
+
+        w.apply(Command::CreateTask {
+            title: "Urgent".into(), service_id: Uuid::nil(),
+            priority: Priority::Urgent, assigned_to: None,
+            start: None, duration: None,
+        }, user).unwrap();
+
+        w.apply(Command::CreateTask {
+            title: "High".into(), service_id: Uuid::nil(),
+            priority: Priority::High, assigned_to: None,
+            start: None, duration: None,
+        }, user).unwrap();
+
+        let queue = w.staging_queue();
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0].priority, Priority::Urgent);
+        assert_eq!(queue[1].priority, Priority::High);
+        assert_eq!(queue[2].priority, Priority::Low);
+    }
+
+    #[test]
+    fn scheduling_validation() {
+        let mut w = test_world();
+        let id = create_task(&mut w);
+
+        let r = w.apply(
+            Command::ScheduleTask { task_id: id, start: D + 480, duration: 0 },
+            Uuid::nil(),
+        );
+        assert_eq!(r.unwrap_err(), WorldError::InvalidDuration);
+    }
+
+    #[test]
+    fn revision_increments_on_every_mutation() {
+        let mut w = test_world();
+        assert_eq!(w.revision, 0);
+
+        let id = create_task(&mut w);
+        assert_eq!(w.revision, 1);
+
+        w.apply(
+            Command::ScheduleTask { task_id: id, start: D + 480, duration: 60 },
+            Uuid::nil(),
+        ).unwrap();
+        assert_eq!(w.revision, 2);
+
+        w.apply(
+            Command::MoveTask { task_id: id, start: D2 + 600, duration: 30 },
+            Uuid::nil(),
+        ).unwrap();
+        assert_eq!(w.revision, 3);
+
+        w.apply(Command::CompleteTask { task_id: id }, Uuid::nil()).unwrap();
+        assert_eq!(w.revision, 4);
+    }
+
+    #[test]
+    fn event_log_tracks_history() {
+        let mut w = test_world();
+        let id = create_task(&mut w);
+
+        w.apply(
+            Command::ScheduleTask { task_id: id, start: D + 480, duration: 60 },
+            Uuid::nil(),
+        ).unwrap();
+
+        assert_eq!(w.log.len(), 2);
+        assert_eq!(w.log[0].0, 1);
+        assert_eq!(w.log[1].0, 2);
+    }
+
+    #[test]
+    fn events_since_for_reconnect() {
+        let mut w = test_world();
+        create_task(&mut w);
+        create_task(&mut w);
+        create_task(&mut w);
+
+        let events = w.events_since(1).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, 2);
+        assert_eq!(events[1].0, 3);
+
+        let events = w.events_since(3).unwrap();
+        assert_eq!(events.len(), 0);
+
+        let events = w.events_since(0).unwrap();
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn failed_commands_dont_change_state() {
+        let mut w = test_world();
+        let rev_before = w.revision;
+        let log_len_before = w.log.len();
+
+        let _ = w.apply(
+            Command::DeleteTask { task_id: Uuid::new_v4() },
+            Uuid::nil(),
+        );
+
+        assert_eq!(w.revision, rev_before);
+        assert_eq!(w.log.len(), log_len_before);
+    }
+}

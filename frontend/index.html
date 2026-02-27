@@ -3,12 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IRONCLAD — Flashlight Overlay Stress Test</title>
+    <title>txxt</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <header id="controls">
-        <span class="title">IRONCLAD STRESS TEST</span>
+        <span class="title">txxt</span>
 
         <label>
             Radius <output id="radius-val">120</output>px
@@ -16,77 +16,32 @@
         </label>
 
         <label>
-            Shapes <output id="shape-val">50</output>
-            <input type="range" id="shape-slider" min="10" max="2000" step="10" value="50">
-        </label>
-
-        <label>
-            Density <output id="density-val">3</output>
-            <input type="range" id="density-slider" min="1" max="10" step="1" value="3">
-        </label>
-
-        <label>
             <input type="checkbox" id="show-circle" checked>
             Show circle
         </label>
-
-        <button id="regenerate">Regenerate</button>
     </header>
 
     <main id="engine-container">
         <div id="perf"></div>
     </main>
 
-    <script src="ironclad.js"></script>
+    <script src="txxt.js"></script>
     <script>
-        const harness = new TestHarness('engine-container');
+        const client = new SidecarClient('engine-container');
 
-        // Read initial control values
         const radiusSlider = document.getElementById('radius-slider');
-        const radiusVal = document.getElementById('radius-val');
-        const shapeSlider = document.getElementById('shape-slider');
-        const shapeVal = document.getElementById('shape-val');
-        const densitySlider = document.getElementById('density-slider');
-        const densityVal = document.getElementById('density-val');
-        const showCircle = document.getElementById('show-circle');
-        const regenBtn = document.getElementById('regenerate');
+        const radiusVal    = document.getElementById('radius-val');
+        const showCircle   = document.getElementById('show-circle');
 
-        function regen() {
-            harness.regenerate(
-                parseInt(shapeSlider.value),
-                parseInt(densitySlider.value)
-            );
-        }
-
-        // Initial generation
-        regen();
-
-        // Flashlight radius
         radiusSlider.addEventListener('input', () => {
             const v = parseInt(radiusSlider.value);
             radiusVal.textContent = v;
-            harness.setFlashlightRadius(v);
+            client.setFlashlightRadius(v);
         });
 
-        // Shape count — regenerate on change
-        shapeSlider.addEventListener('input', () => {
-            shapeVal.textContent = shapeSlider.value;
-            regen();
-        });
-
-        // Overlap density — regenerate on change
-        densitySlider.addEventListener('input', () => {
-            densityVal.textContent = densitySlider.value;
-            regen();
-        });
-
-        // Show flashlight circle toggle
         showCircle.addEventListener('change', () => {
-            harness.setShowCircle(showCircle.checked);
+            client.setShowCircle(showCircle.checked);
         });
-
-        // Regenerate button
-        regenBtn.addEventListener('click', regen);
     </script>
 </body>
 </html>

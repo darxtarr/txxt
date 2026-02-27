@@ -1,193 +1,94 @@
 # txxt — Current State
 
-Last updated: 2026-02-26
+Last updated: 2026-02-27
 
 Fast handoff for incoming sessions. Architecture rationale lives in `DESIGN.md`.
 
 ---
 
-## Phase: Flashlight Overlay Stress Test
+## Phase: Sidecar Built — Frontend Integration Next
 
-**Testbed implemented and working locally.** Waiting for CloudPC upgrade to
-complete before running the real stress test on VDI hardware.
+### Flashlight testbed (2026-02-26) — DONE
 
-### What was built (2026-02-26)
+Browser-only testbed in `frontend/` works locally. FPS rock solid. SVG arc bug
+fixed. Still waiting for CloudPC upgrade to run real VDI stress test, but the
+sidecar was built in parallel to unblock progress.
 
-Three fresh files in `frontend/` — no server, open `index.html` directly:
+### Rust sidecar (2026-02-27) — DONE
 
-- **`index.html`** — control bar (radius, shape count, overlap density, show
-  circle toggle, regenerate button), perf counter display, bootstrap script.
-- **`styles.css`** — dark theme, SVG overlay with 80ms opacity fade
-  transitions, perf counter overlay.
-- **`ironclad.js`** — two clearly separated sections:
-  1. **Overlay class (PRODUCTION)** — SVG pool pattern. 256 `<line>` + 64
-     `<path>` elements allocated at init, never created/destroyed. `update()`
-     maps draw commands to pool slots (active → opacity 1, inactive → opacity
-     0). CSS transition handles fade. Zero DOM churn, zero GC pressure. This
-     module has no knowledge of shapes, SDF, or cursors — it receives commands
-     and executes them. Survives into final IRONCLAD unchanged.
-  2. **TestHarness class (THROWAWAY)** — simulates the Rust sidecar. Shape
-     generation with cluster-based overlap density. Canvas background baking.
-     SDF functions (rect, circle, rounded rect, triangle). Clip geometry:
-     circle ∩ segment (parametric quadratic), circle ∩ arc (two-circle
-     intersection with angle range clipping). rAF loop with per-phase
-     `performance.now()` timing. Rolling 60-frame perf averages.
+Full modular sidecar built. 52 tests, all pass. `cargo build` and `cargo test`
+clean (warnings are expected dead code from Phase 1 stubs).
 
-### Bug fixed: full-circle SVG arcs
+```
+backend/src/
+  main.rs       — boot, shared state, Axum router, serves frontend/
+  world.rs      — pure state machine (ported from archive, +artifact_count, -password_hash)
+  persist.rs    — redb save file (ported from archive, no auth/argon2)
+  wire.rs       — hop 1 binary protocol (0x10–0x2E), hop 2 stubs
+  renderer.rs   — tiny-skia with chrome cache, outputs image + Vec<RenderedShape>
+  spatial.rs    — SDF + clip geometry (ported from JS testbed), OverlayGenerator trait
+  game.rs       — Axum WS handler, per-connection context, subscribe-before-snapshot
+```
 
-SVG `<path>` arcs cannot represent a full circle — when startAngle and
-endAngle produce the same (x,y) point, the arc draws nothing. This caused
-circles fully inside the flashlight to go dark (only a dot visible from
-`stroke-linecap: round`). Fix: `arcToPath()` now detects sweepAngle ≥ 2π and
-splits into two semicircular arc commands.
+**What each module does:**
 
-### Local test results
+- **world.rs** — Command/Event state machine. Task has `artifact_count: u8`.
+  User has no `password_hash` (auth removed). All archive tests carried forward.
+- **persist.rs** — redb save file. `flush()` after every mutation. `load_world()`
+  on boot. Seeds default services + user. No argon2.
+- **wire.rs** — Hop 1: `BackgroundImage(0x10)`, `CandidateList(0x11)`,
+  `OverlayCommands(0x1A)`, `ClientMsg(0x20–0x2E)`. Hop 2: `pack_snapshot` and
+  `pack_event` as `#[allow(dead_code)]` stubs with task record stride (192 bytes).
+- **renderer.rs** — Chrome cache (grid + headers) rebuilt only on viewport/view
+  change. Task layer stamped on clone of chrome. Returns `RenderOutput`:
+  image bytes + `Vec<RenderedShape>` (pixel-space bounding boxes for spatial).
+- **spatial.rs** — `trait OverlayGenerator` (THE modularity seam). `SdfOverlay`
+  is the Phase 1 impl (O(n) brute force, direct port of JS testbed). Separate
+  `build_candidate_list()` function. SDF functions for Rect and RoundedRect.
+  Clip geometry: segment ∩ circle, arc ∩ circle.
+- **game.rs** — Axum WS handler. Subscribe-before-snapshot ordering (critical).
+  `CursorMove` → read-lock shapes → spatial pass → send overlay + candidates.
+  Mutation → write-lock world → flush → re-render → broadcast.
+- **main.rs** — Boot sequence. `AppState` with `Arc<dyn OverlayGenerator>`.
+  Router: `/ws` for game, fallback to `ServeDir` for frontend.
 
-FPS rock solid at all shape counts tested locally. No performance cliff found
-on a dev machine — the real test is CloudPC hardware under VDI codec, pending
-upgrade.
+### What's next: Frontend integration (Step 7 from the plan)
 
-### Next: CloudPC stress test
+Wire the browser to the real sidecar. This is the last step before end-to-end
+testing on CloudPC.
 
-The goal: prove the flashlight overlay interaction model works under VDI codec
-compression on a resource-constrained CloudPC. Not a pretty demo — a stress
-test. We push shape count until performance degrades, find the ceiling, and
-use that data to decide what to build next.
+1. **Delete TestHarness class** from `ironclad.js` (it's throwaway code).
+2. **Add SidecarClient class** — WebSocket connection to `ws://localhost:3000/ws`,
+   binary message decode, 20Hz cursor position send.
+3. **Overlay class stays unchanged** — just gets fed from WS instead of harness.
+4. **Rename IRONCLAD → txxt** everywhere:
+   - `frontend/ironclad.js` → `frontend/txxt.js`
+   - HTML `<title>` and visible text
+   - CLAUDE.md, CURRENT_STATE.md, DESIGN.md references
+   - JS comments and CSS class names
+
+**Gate:** Same visual behavior as testbed, but driven by real sidecar. Browser
+connects, background image appears, cursor movement produces overlay traces.
+
+### After frontend integration
+
+- CloudPC stress test (VDI codec, resource-constrained hardware)
+- Materialization module (mousedown → div, candidate list)
+- Short-ID mapping (wire uses u16 task IDs, world uses UUIDs)
+- EC2 relay (hop 2 — do not wire prematurely)
 
 ---
 
-## What the flashlight overlay IS
+## Modularity seams — what can be swapped
 
-Look at `flashlight-overlay.png` in the repo root. That sketch is the spec.
+| What | Mechanism | Where |
+|------|-----------|-------|
+| Overlay algorithm | `trait OverlayGenerator` | `Arc::new(SdfOverlay)` in main.rs |
+| Image format | `ImageFormat` enum (Png/Jpeg/Rgba) | `image_format` field in AppState |
+| Chrome cache | `ChromeCacheKey` invalidation | Change key fields in renderer.rs |
+| Hop 2 transport | `wire::pack_snapshot`/`pack_event` stubs | Wire in game.rs when EC2 ready |
 
-- The **background image** is static. It contains shapes (task cards, buttons,
-  etc.) baked into a flat image. Between interactions the VDI codec sleeps
-  because nothing changes.
-- The **flashlight** is an invisible circle centered on the cursor. It has a
-  configurable radius.
-- When the flashlight circle overlaps a shape's boundary, the **portion of
-  that boundary inside the circle** is drawn as a green SVG line on top of
-  the background. Only the clipped fragment — not the full edge, not the full
-  shape.
-- Multiple overlapping shapes (common in production — same time slot, multiple
-  users) all trace simultaneously. If 5 shapes overlap under the flashlight,
-  all 5 shapes' clipped edges appear.
-- Move the cursor away → the green traces fade out (CSS opacity transition,
-  ~80ms).
-- In empty space: nothing. No traces, no glow, no dirty pixels. Codec sleeps.
-
-This is the **liveness signal**. The cursor moves locally (VDI client renders
-it). The overlay updates through the browser → codec → screen pipeline. If
-the overlay tracks the cursor: session is alive. If it lags: session is slow.
-If it freezes: session is dead. No status widget needed — the physics of the
-interaction IS the health check.
-
----
-
-## What we are building (three files, all fresh)
-
-```
-frontend/
-  index.html      — page structure, control bar, script tag
-  styles.css      — dark theme, SVG overlay styling, perf counter styling
-  ironclad.js     — two sections:
-                     1. Overlay module (PRODUCTION — survives into final IRONCLAD)
-                     2. Test harness (THROWAWAY — replaced by real sidecar later)
-```
-
-No server needed. Open `index.html` in a browser (file:// or localhost).
-
-### Overlay module (production code)
-
-A dumb SVG executor. Receives an array of draw commands. Draws them. Knows
-nothing about shapes, SDF, cursor position, or the world.
-
-```
-class Overlay {
-  constructor(container, opts)  // creates SVG element + fixed pool of <line>/<path>
-  update(commands)              // maps commands to pool elements, shows active, hides rest
-  destroy()                     // cleanup
-}
-```
-
-**Pool pattern**: fixed set of `<line>` and `<path>` SVG elements allocated at
-startup. Never created or destroyed after init. Active elements get attributes
-updated + `opacity: 1`. Inactive elements get `opacity: 0`. CSS transition
-handles fade-out. Zero GC pressure. Zero DOM churn.
-
-**Command format** (mirrors what the sidecar will send as `0x1A OverlayCommands`):
-```
-{ type: 'segment', x1, y1, x2, y2 }
-{ type: 'arc', cx, cy, r, startAngle, sweepAngle }
-{ type: 'clear' }
-```
-
-This module's API is the contract. When the real sidecar exists, it sends
-binary `0x1A` messages. IRONCLAD decodes them into these same command objects
-and calls `overlay.update()`. The module doesn't change.
-
-### Test harness (throwaway code)
-
-Simulates what the sidecar does. Replaced entirely when the Rust sidecar
-exists. Clearly marked in the source.
-
-Responsibilities:
-1. **Define shapes** — random/semi-random placement with deliberate overlaps
-2. **Bake background** — draw shapes to offscreen canvas → export as data URL
-   → set as `background-image` on container. This simulates the sidecar's
-   tiny-skia render output.
-3. **SDF evaluation** — on each cursor update, compute signed distance from
-   cursor to every shape boundary. O(n) brute force — we want to find where
-   n kills performance.
-4. **Clip geometry** — for shapes within flashlight radius, clip their edge
-   primitives to the flashlight circle interior. Two intersection primitives:
-   circle ∩ line segment (quadratic solve) and circle ∩ arc (two-circle
-   intersection). Output: array of draw commands.
-5. **Feed overlay** — call `overlay.update(commands)` every frame.
-
-### Shape decomposition
-
-Every shape decomposes to line segments and arcs before clipping:
-- Rectangle → 4 segments
-- Rounded rectangle → 4 segments + 4 quarter-circle arcs
-- Circle → 1 full arc
-- Triangle/polygon → N segments
-
-The harness stores both the shape (for SDF) and its edge primitives (for
-clipping). The clip math only knows segments and arcs — it doesn't care what
-shape they came from.
-
----
-
-## Controls and diagnostics
-
-**Control bar:**
-- Flashlight radius: slider 20–500px, default 120
-- Shape count: slider 10–2000, default 50 (triggers regenerate)
-- Overlap density: slider (spread vs pile-up, controls clustering)
-- Show flashlight circle: checkbox (yellow SVG circle, default ON — turn off
-  once you've confirmed the radius visually)
-- Regenerate button
-
-**Performance counters** (always visible, top-right):
-```
-FPS: 60 | frame: 16.7ms
-SDF:    0.12ms (50 shapes)
-Clip:   0.08ms (12 edges)
-SVG:    0.05ms (12/48 lines, 3/16 arcs)
-Total:  0.25ms
-```
-
-Using `performance.now()`. Rolling average over 60 frames.
-
-**Test procedure:**
-1. Start at 50 shapes. Confirm traces align with shapes. Confirm fade works.
-2. Crank to 200, 500, 1000, 2000. Watch FPS and frame time.
-3. Increase overlap density. Watch SVG active count (more overlaps = more
-   simultaneous traces = more draw commands per frame).
-4. Find the cliff: where does FPS drop below 30?
-5. On CloudPC: repeat with Task Manager open. Note CPU% at each shape count.
-6. Key question: do the green traces read clearly through the VDI codec?
+Only ONE trait: `OverlayGenerator`. Everything else is data boundaries or config.
 
 ---
 
@@ -196,7 +97,7 @@ Using `performance.now()`. Rolling average over 60 frames.
 ```
 [Laptop] ── VDI/WAN ──► [Azure CloudPC]
                           │  localhost
-                     [IRONCLAD] ◄──WS──► [Sidecar]
+                     [txxt] ◄──WS──► [Sidecar]
                           │
                        WAN/corporate
                           │
@@ -205,40 +106,30 @@ Using `performance.now()`. Rolling average over 60 frames.
 
 The axiom: **everything is possible but nothing is real until the click.**
 
-In production, the sidecar sends two independent outputs from the same SDF pass:
-- `0x11` CandidateList — click semantics (what to materialize on mousedown)
-- `0x1A` OverlayCommands — UX only (clipped element edges for flashlight)
-
-The testbed only implements the overlay path. Materialization comes next, as a
-separate module with a separate test, after the overlay is proven on hardware.
-
 ---
 
 ## Data model (locked 2026-02-19)
 
 - `Task.start: Option<u32>` — minutes since Unix epoch. `None` = staged.
 - `Task.duration: Option<u16>` — minutes.
+- `Task.artifact_count: u8` — attached files count.
 - Derive: `epoch_day = start/1440`, `dow = (epoch_day+3)%7`, `time = start%1440`.
 - Views: sliding windows `window_start..window_end` (minutes since epoch).
 
 ---
 
-## Build order (after testbed passes)
+## Running the sidecar
 
-Do not start here until the overlay stress test has run on real CloudPC
-hardware and we know the performance ceiling.
+```bash
+cd backend && cargo build          # Build
+cd backend && cargo test           # 52 tests
+cd backend && cargo run            # Starts on :3000, serves frontend/
 
-1. `world.rs` — pure state machine, no I/O
-2. `wire.rs` — binary protocol, both hops
-3. `renderer.rs` — tiny-skia, two-layer chrome cache
-4. `game.rs` — per-connection context, wires everything together
-5. IRONCLAD — replace test harness with real WebSocket; overlay module is
-   already written and tested from the testbed
-6. Materialization module — candidate cache, mousedown → div, mouseup → remove
-7. Spatial query in Rust — SDF + clip geometry, matching the JS harness output
-8. EC2 relay — do not wire prematurely
-
-Phase 1 target: single-user, localhost only, full interaction loop.
+# Environment variables:
+TXXT_DB=path/to/txxt.redb          # Save file (default: txxt.redb)
+PORT=3000                          # Listen port (default: 3000)
+TXXT_FRONTEND=../frontend          # Frontend path (default: ../frontend)
+```
 
 ---
 
@@ -250,7 +141,7 @@ Phase 1 target: single-user, localhost only, full interaction loop.
 | `CURRENT_STATE.md` | This file — where we are and what to build next |
 | `CLAUDE.md` | Session instructions for AI partners |
 | `KEYBINDS.md` | Active and planned keybinds |
-| `flashlight-overlay.png` | Visual spec for the flashlight overlay |
-| `frontend/` | IRONCLAD — testbed in progress |
-| `backend/src/` | Sidecar — empty until testbed passes |
+| `flashlight-overlay.png` | Visual spec for flashlight overlay |
+| `frontend/` | Browser client — testbed, pending WS integration |
+| `backend/src/` | Sidecar — fully built, 52 tests pass |
 | `archive/` | Previous versions — reference only |
